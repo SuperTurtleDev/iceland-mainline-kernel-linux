@@ -72,6 +72,7 @@
 #define OWB_CMD_GENERAL_ACK	0x3B
 
 /* 0x3A sub commands */
+#define OWB_GEN_SLEEP		0x02
 #define OWB_GEN_BATTERY_STATUS	0x0E
 #define OWB_GEN_BRIGHTNESS	0x1C
 
@@ -86,6 +87,8 @@
 #define POGO_RESP_TIMEOUT_MS	100
 #define POGO_XFER_RETRIES	3
 #define POGO_DETECT_DEBOUNCE_MS	120
+#define POGO_DETECT_SAMPLES	6	/* 6 x 20 ms, as the vendor driver */
+#define POGO_DETECT_SAMPLE_MS	20
 #define POGO_HB_POLL_MS		250
 #define POGO_HB_TIMEOUT_MS	500	/* after the first sync frame */
 #define POGO_BOOT_TIMEOUT_MS	2000	/* power on -> first sync frame */
@@ -127,6 +130,7 @@ struct pogo_kbd {
 	/* link state */
 	bool powered;
 	bool connected;
+	bool hb_seen;		/* MCU left its plug-in phase */
 	unsigned long last_rx;
 	unsigned int retry_ms;
 	u8 brand;
@@ -617,14 +621,20 @@ static void pogo_handle_sync(struct pogo_kbd *kb, const u8 *p, unsigned int len)
 	if (p[0] == OWB_SYNC_PLUG_IN && p[1] == 0x02 && len >= 9) {
 		kb->brand = p[2];
 		memcpy(kb->mac, &p[3], POGO_MAC_LEN);
-		replug = kb->connected;
+		/*
+		 * The MCU repeats this frame until the host has talked to it;
+		 * only a plug-in frame after regular heartbeats is a re-plug.
+		 */
+		replug = kb->connected && kb->hb_seen;
 	} else if (p[0] == OWB_SYNC_HEARTBEAT && p[1] == 0x02 && len >= 10) {
 		kb->brand = p[3];
 		memcpy(kb->mac, &p[4], POGO_MAC_LEN);
+		kb->hb_seen = true;
 	}
 
 	if (!kb->connected || replug) {
 		kb->connected = true;
+		kb->hb_seen = false;
 		kb->retry_ms = POGO_RETRY_MIN_MS;
 		schedule_work(&kb->plug_work);
 	}
@@ -777,6 +787,7 @@ static void pogo_power_on(struct pogo_kbd *kb)
 {
 	dev_dbg(kb->dev, "power on\n");
 	kb->connected = false;
+	kb->hb_seen = false;
 	kb->battery_level = -1;
 	kb->last_rx = jiffies;
 	kb->powered = true;
@@ -802,15 +813,28 @@ static void pogo_detect_work(struct work_struct *work)
 	struct pogo_kbd *kb = container_of(work, struct pogo_kbd,
 					   detect_work.work);
 
+	int i;
+
 	if (kb->powered)
 		return;
 
-	if (gpiod_get_value_cansleep(kb->wake_gpio)) {
-		pogo_power_on(kb);
-	} else {
-		kb->retry_ms = POGO_RETRY_MIN_MS;
-		pogo_wake_irq_enable(kb, true);
+	/* the unpowered keyboard holds the wire low; require a stable level */
+	for (i = 0; i < POGO_DETECT_SAMPLES; i++) {
+		if (!gpiod_get_value_cansleep(kb->wake_gpio))
+			break;
+		msleep(POGO_DETECT_SAMPLE_MS);
 	}
+	if (i == POGO_DETECT_SAMPLES) {
+		pogo_power_on(kb);
+		return;
+	}
+
+	kb->retry_ms = POGO_RETRY_MIN_MS;
+	pogo_wake_irq_enable(kb, true);
+	/* the edge may have happened before the irq was armed */
+	if (gpiod_get_value_cansleep(kb->wake_gpio))
+		mod_delayed_work(system_dfl_wq, &kb->detect_work,
+				 msecs_to_jiffies(POGO_DETECT_DEBOUNCE_MS));
 }
 
 static void pogo_hb_work(struct work_struct *work)
@@ -856,7 +880,14 @@ static void pogo_plug_work(struct work_struct *work)
 			 kb->kbd_name, kb->brand, kb->mac);
 	}
 
-	/* restore host side state on the (possibly re-plugged) MCU */
+	/*
+	 * Report the host as awake: this is what moves the MCU from the
+	 * repeated plug-in sync frames to regular heartbeats.  Then restore
+	 * the host side state on the (possibly re-plugged) MCU.
+	 */
+	ret = pogo_set_general(kb, OWB_GEN_SLEEP, 0);
+	if (ret)
+		dev_warn(kb->dev, "wake notify failed: %d\n", ret);
 	pogo_set_leds(kb);
 	if (kb->brightness)
 		pogo_set_general(kb, OWB_GEN_BRIGHTNESS, kb->brightness);
