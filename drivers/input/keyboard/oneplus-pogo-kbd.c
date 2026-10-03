@@ -29,6 +29,7 @@
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/leds.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -100,6 +101,7 @@
 #define POGO_KEY_REPORT_LEN	8
 #define POGO_MEDIA_REPORT_LEN	4
 #define POGO_MAC_LEN		6
+#define POGO_BACKLIGHT_MAX	100	/* MCU accepts 0..100 */
 
 struct pogo_kbd {
 	struct serdev_device *serdev;
@@ -142,6 +144,7 @@ struct pogo_kbd {
 	struct work_struct plug_work;
 	struct work_struct led_work;
 	bool caps_led;
+	struct led_classdev backlight;
 	u8 brightness;
 
 	/* input */
@@ -893,6 +896,35 @@ static void pogo_plug_work(struct work_struct *work)
 		pogo_set_general(kb, OWB_GEN_BRIGHTNESS, kb->brightness);
 }
 
+/* ------------------------------------------------------------------------ */
+/* keyboard backlight as a LED class device (picked up by UPower/GNOME)    */
+
+static int pogo_backlight_set(struct led_classdev *cdev, enum led_brightness value)
+{
+	struct pogo_kbd *kb = container_of(cdev, struct pogo_kbd, backlight);
+
+	kb->brightness = value;
+	/* when detached just remember the level; plug_work restores it */
+	if (!kb->connected)
+		return 0;
+	return pogo_set_general(kb, OWB_GEN_BRIGHTNESS, value);
+}
+
+static int pogo_register_backlight(struct pogo_kbd *kb)
+{
+	struct led_init_data init_data = {
+		/* no colour: yields "pogo-keyboard::kbd_backlight" */
+		.default_label = ":" LED_FUNCTION_KBD_BACKLIGHT,
+		.devicename = "pogo-keyboard",
+	};
+
+	kb->backlight.max_brightness = POGO_BACKLIGHT_MAX;
+	kb->backlight.brightness_set_blocking = pogo_backlight_set;
+	kb->backlight.flags = LED_CORE_SUSPENDRESUME;
+
+	return devm_led_classdev_register_ext(kb->dev, &kb->backlight, &init_data);
+}
+
 static void pogo_led_work(struct work_struct *work)
 {
 	struct pogo_kbd *kb = container_of(work, struct pogo_kbd, led_work);
@@ -914,36 +946,7 @@ static irqreturn_t pogo_wake_isr(int irq, void *data)
 }
 
 /* ------------------------------------------------------------------------ */
-/* sysfs: backlight level, keyboard battery, link state                     */
-
-static ssize_t brightness_show(struct device *dev,
-			       struct device_attribute *attr, char *buf)
-{
-	struct pogo_kbd *kb = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%u\n", kb->brightness);
-}
-
-static ssize_t brightness_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct pogo_kbd *kb = dev_get_drvdata(dev);
-	u8 level;
-	int ret;
-
-	ret = kstrtou8(buf, 0, &level);
-	if (ret)
-		return ret;
-	kb->brightness = level;
-	if (kb->connected) {
-		ret = pogo_set_general(kb, OWB_GEN_BRIGHTNESS, level);
-		if (ret)
-			return ret;
-	}
-	return count;
-}
-static DEVICE_ATTR_RW(brightness);
+/* sysfs: keyboard battery and link state                                   */
 
 static ssize_t battery_level_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
@@ -969,7 +972,6 @@ static ssize_t connected_show(struct device *dev,
 static DEVICE_ATTR_RO(connected);
 
 static struct attribute *pogo_attrs[] = {
-	&dev_attr_brightness.attr,
 	&dev_attr_battery_level.attr,
 	&dev_attr_connected.attr,
 	NULL
@@ -1055,6 +1057,10 @@ static int pogo_probe(struct serdev_device *serdev)
 	ret = serdev_device_set_parity(serdev, SERDEV_PARITY_NONE);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to set parity\n");
+
+	ret = pogo_register_backlight(kb);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to register backlight\n");
 
 	ret = devm_request_irq(dev, kb->wake_irq, pogo_wake_isr,
 			       IRQF_TRIGGER_FALLING | IRQF_NO_AUTOEN,
