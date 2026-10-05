@@ -147,8 +147,14 @@ static int ktz8869_probe(struct i2c_client *client)
 	}
 
 	ktz->enable_gpio = devm_gpiod_get_optional(&client->dev, "enable", GPIOD_OUT_HIGH);
-	if (IS_ERR(ktz->enable_gpio))
-		return PTR_ERR(ktz->enable_gpio);
+	if (IS_ERR(ktz->enable_gpio)) {
+		/* GPIO controller may still be probing (tlmm defers on this
+		 * platform); UEFI already drives HWEN high, so proceed without
+		 * it rather than blocking probe in a defer loop */
+		dev_info(&client->dev, "enable gpio unavailable (%ld), continuing without\n",
+			 PTR_ERR(ktz->enable_gpio));
+		ktz->enable_gpio = NULL;
+	}
 
 	memset(&props, 0, sizeof(props));
 	props.type = BACKLIGHT_RAW;
