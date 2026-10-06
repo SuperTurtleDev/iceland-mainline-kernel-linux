@@ -137,14 +137,8 @@ static int ktz8869_probe(struct i2c_client *client)
 	ret = devm_regulator_get_enable(&client->dev, "vin");
 	if (ret)
 		return dev_err_probe(&client->dev, ret, "get regulator vin failed\n");
-	/*
-	 * iceland ties the IO rail to HWEN (the enable gpio) instead of a
-	 * switchable regulator: the node carries no vddio-supply, so use the
-	 * optional variant -- a plain get fabricates a dummy regulator and
-	 * warns on every probe.
-	 */
-	ret = devm_regulator_get_enable_optional(&client->dev, "vddio");
-	if (ret && ret != -ENODEV)
+	ret = devm_regulator_get_enable(&client->dev, "vddio");
+	if (ret)
 		return dev_err_probe(&client->dev, ret, "get regulator vddio failed\n");
 
 	if (id->driver_data == 2) {
