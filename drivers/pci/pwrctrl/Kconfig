@@ -8,6 +8,13 @@ config PCI_PWRCTRL
 
 config PCI_PWRCTRL_PWRSEQ
 	tristate
+	# iceland: hidden tristate only pushed by the ath11k/ath12k selects
+	# (both =m here), which kept the PCI glue a module and made the
+	# builtin qcom-pcie wait on udev (16 probe retries per boot).  Keying
+	# the default on WCN would recurse (WCN sits under if
+	# POWER_SEQUENCING, which this symbol selects), so default it on the
+	# platform instead.
+	default y if ARCH_QCOM && PCI
 	select POWER_SEQUENCING
 	select PCI_PWRCTRL
 
