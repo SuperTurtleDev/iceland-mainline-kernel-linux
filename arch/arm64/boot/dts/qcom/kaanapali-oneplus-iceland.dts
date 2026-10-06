@@ -1015,7 +1015,8 @@
 		compatible = "kinetic,ktz8869b";
 		reg = <0x11>;
 		vin-supply = <&vph_pwr>;
-		enable-gpios = <&tlmm 1 GPIO_ACTIVE_HIGH>;
+		/* enable (HWEN, tlmm 1) is owned by the i2c14 master node;
+		 * duplicating it here made gpiolib classify the line shared */
 	};
 };
 
