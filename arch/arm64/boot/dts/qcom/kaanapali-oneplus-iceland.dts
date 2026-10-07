@@ -1026,13 +1026,13 @@
 
 /*
  * HLOS cannot write the PMIC RTC counter (owned by TZ), so the driver
- * persists a UTC offset in SDAM instead.  Slot 0x7c-0x7f in SDAM2:
+ * persists a UTC offset in SDAM instead.  Slot 0x7c-0x83 in SDAM2:
  * free of Android HLOS cells (0x48-0x7b), verified to persist across
  * reboots (marker test 2026-10-07).
  */
 &pmk8850_sdam_2 {
 	rtc_offset: rtc-offset@7c {
-		reg = <0x7c 0x4>;
+		reg = <0x7c 0x8>;
 	};
 };
 

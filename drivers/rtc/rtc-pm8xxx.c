@@ -64,7 +64,8 @@ struct qcom_uefi_rtc_info {
  * @dev:		device structure
  * @rtc_info:		qcom uefi rtc-info structure
  * @nvmem_cell:		nvmem cell for offset
- * @offset:		offset from epoch in seconds
+ * @offset:		offset from epoch in seconds (s64 for full Unix
+ *			timestamp range)
  * @offset_dirty:	offset needs to be stored on shutdown
  */
 struct pm8xxx_rtc {
@@ -77,7 +78,7 @@ struct pm8xxx_rtc {
 	struct device *dev;
 	struct qcom_uefi_rtc_info rtc_info;
 	struct nvmem_cell *nvmem_cell;
-	u32 offset;
+	s64 offset;
 	bool offset_dirty;
 };
 
@@ -180,25 +181,25 @@ static int pm8xxx_rtc_read_nvmem_offset(struct pm8xxx_rtc *rtc_dd)
 		return rc;
 	}
 
-	if (len != sizeof(u32)) {
+	if (len != sizeof(s64)) {
 		dev_dbg(rtc_dd->dev, "unexpected nvmem cell size %zu\n", len);
 		kfree(buf);
 		return -EINVAL;
 	}
 
-	rtc_dd->offset = get_unaligned_le32(buf);
+	rtc_dd->offset = get_unaligned_le64(buf);
 
 	kfree(buf);
 
 	return 0;
 }
 
-static int pm8xxx_rtc_write_nvmem_offset(struct pm8xxx_rtc *rtc_dd, u32 offset)
+static int pm8xxx_rtc_write_nvmem_offset(struct pm8xxx_rtc *rtc_dd, s64 offset)
 {
-	u8 buf[sizeof(u32)];
+	u8 buf[sizeof(s64)];
 	int rc;
 
-	put_unaligned_le32(offset, buf);
+	put_unaligned_le64(offset, buf);
 
 	rc = nvmem_cell_write(rtc_dd->nvmem_cell, buf, sizeof(buf));
 	if (rc < 0) {
@@ -240,10 +241,10 @@ static int pm8xxx_rtc_read_raw(struct pm8xxx_rtc *rtc_dd, u32 *secs)
 	return 0;
 }
 
-static int pm8xxx_rtc_update_offset(struct pm8xxx_rtc *rtc_dd, u32 secs)
+static int pm8xxx_rtc_update_offset(struct pm8xxx_rtc *rtc_dd, s64 secs)
 {
 	u32 raw_secs;
-	u32 offset;
+	s64 offset;
 	int rc;
 
 	if (!rtc_dd->nvmem_cell && !rtc_dd->use_uefi)
@@ -345,7 +346,7 @@ static int __pm8xxx_rtc_set_time(struct pm8xxx_rtc *rtc_dd, u32 secs)
 static int pm8xxx_rtc_set_time(struct device *dev, struct rtc_time *tm)
 {
 	struct pm8xxx_rtc *rtc_dd = dev_get_drvdata(dev);
-	u32 secs;
+	time64_t secs;
 	int rc;
 
 	secs = rtc_tm_to_time64(tm);
@@ -358,26 +359,29 @@ static int pm8xxx_rtc_set_time(struct device *dev, struct rtc_time *tm)
 	if (rc)
 		return rc;
 
-	dev_dbg(dev, "set time: %ptRd %ptRt (%u + %u)\n", tm, tm,
-			secs - rtc_dd->offset, rtc_dd->offset);
+	dev_dbg(dev, "set time: %ptRd %ptRt (%lld + %lld)\n", tm, tm,
+		(long long)(secs - rtc_dd->offset),
+		(long long)rtc_dd->offset);
 	return 0;
 }
 
 static int pm8xxx_rtc_read_time(struct device *dev, struct rtc_time *tm)
 {
 	struct pm8xxx_rtc *rtc_dd = dev_get_drvdata(dev);
-	u32 secs;
+	u32 raw_secs;
+	s64 secs;
 	int rc;
 
-	rc = pm8xxx_rtc_read_raw(rtc_dd, &secs);
+	rc = pm8xxx_rtc_read_raw(rtc_dd, &raw_secs);
 	if (rc)
 		return rc;
 
-	secs += rtc_dd->offset;
+	secs = (s64)raw_secs + rtc_dd->offset;
 	rtc_time64_to_tm(secs, tm);
 
-	dev_dbg(dev, "read time: %ptRd %ptRt (%u + %u)\n", tm, tm,
-			secs - rtc_dd->offset, rtc_dd->offset);
+	dev_dbg(dev, "read time: %ptRd %ptRt (%lld + %lld)\n", tm, tm,
+		(long long)(secs - rtc_dd->offset),
+		(long long)rtc_dd->offset);
 	return 0;
 }
 
@@ -638,7 +642,8 @@ static int pm8xxx_rtc_probe(struct platform_device *pdev)
 		return PTR_ERR(rtc_dd->rtc);
 
 	rtc_dd->rtc->ops = &pm8xxx_rtc_ops;
-	rtc_dd->rtc->range_max = U32_MAX;
+	/* The raw counter is u32 but the s64 offset extends the range */
+	rtc_dd->rtc->range_max = RTC_TIMESTAMP_END_9999;
 
 	if (rtc_dd->alarm_irq) {
 		rc = devm_request_any_context_irq(&pdev->dev, rtc_dd->alarm_irq,
