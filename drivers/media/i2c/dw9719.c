@@ -51,6 +51,9 @@
  * registers sit at the DW9719 offsets.
  */
 #define DW9714V_ID			0xFE
+/* vendor init for the OnePlus Pad 4 module: MODE 0x80, FREQ 0x79 */
+#define DW9714V_DEFAULT_SAC		2
+#define DW9714V_DEFAULT_VCM_FREQ	0x79
 
 #define DW9719_CONTROL			CCI_REG8(2)
 #define DW9719_STANDBY			0x00
@@ -162,9 +165,8 @@ static int dw9719_power_up(struct dw9719_device *dw9719, bool detect)
 		switch (val) {
 		case DW9714V_ID:
 			dw9719->model = DW9714V;
-			dw9719->mode_low_bits = 0x00;
-			dw9719->sac_mode = DW9719_DEFAULT_SAC;
-			dw9719->vcm_freq = DW9719_DEFAULT_VCM_FREQ;
+			dw9719->sac_mode = DW9714V_DEFAULT_SAC;
+			dw9719->vcm_freq = DW9714V_DEFAULT_VCM_FREQ;
 			break;
 		case DW9719_ID:
 			dw9719->model = DW9719;
@@ -201,6 +203,7 @@ props:
 	}
 
 	switch (dw9719->model) {
+	case DW9714V:
 	case DW9800K:
 		cci_write(dw9719->regmap, DW9719_CONTROL, DW9719_ENABLE_RINGING, &ret);
 		cci_write(dw9719->regmap, DW9719_MODE,
@@ -224,7 +227,6 @@ props:
 		cci_write(dw9719->regmap, DW9761_VCM_PRELOAD,
 			  DW9761_DEFAULT_VCM_PRELOAD, &ret);
 		fallthrough;
-	case DW9714V:
 	case DW9719:
 		cci_write(dw9719->regmap, DW9719_CONTROL, DW9719_ENABLE_RINGING, &ret);
 		cci_write(dw9719->regmap, DW9719_MODE, dw9719->mode_low_bits |
