@@ -1060,6 +1060,8 @@
 		compatible = "smartsens,sc1300cs";
 		reg = <0x36>;
 
+		orientation = <1>;
+
 		clocks = <&rpmhcc RPMH_DIV_CLK1>;
 
 		/* vendor drives the pin high while the sensor runs */
@@ -1102,6 +1104,8 @@
 	camera_front: camera@10 {
 		compatible = "smartsens,sc820cs";
 		reg = <0x10>;
+
+		orientation = <0>;
 
 		clocks = <&rpmhcc RPMH_DIV_CLK1>;
 
