@@ -890,6 +890,30 @@
 	};
 };
 
+&camss {
+	status = "okay";
+
+	ports {
+		/* rear sensor, 4 D-PHY data lanes */
+		port@4 {
+			csiphy4_ep: endpoint {
+				clock-lanes = <4>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&cam_rear_ep>;
+			};
+		};
+
+		/* front sensor, 4 D-PHY data lanes */
+		port@5 {
+			csiphy5_ep: endpoint {
+				clock-lanes = <4>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&cam_front_ep>;
+			};
+		};
+	};
+};
+
 &gpu_zap_shader {
 	firmware-name = "qcom/kaanapali/iceland/gen80200_zap.mbn";
 };
@@ -990,6 +1014,73 @@
 				wcd_usbss_sbu_mux: endpoint {
 					remote-endpoint = <&pmic_glink_sbu>;
 				};
+			};
+		};
+	};
+};
+
+&i2c9 {
+	clock-frequency = <400000>;
+
+	status = "okay";
+
+	/*
+	 * Camera sensors are plain GENI I2C devices on SE9 (not CCI).
+	 * Vendor DT uses 8-bit addresses: rear 0x6c, front 0x20.
+	 * Both share one 19.2 MHz RPMh clock (DIV_CLK1), routed out on
+	 * PMK8850 GPIO2 (rear) / GPIO1 (front) in func2.
+	 */
+
+	/* Rear 13MP, SmartSens SC1300CS */
+	camera_rear: camera@36 {
+		compatible = "smartsens,sc1300cs";
+		reg = <0x36>;
+
+		clocks = <&rpmhcc RPMH_DIV_CLK1>;
+
+		/* vendor drives the pin high while the sensor runs */
+		reset-gpios = <&pmh0110_g_e0_gpios 14 GPIO_ACTIVE_LOW>;
+
+		pinctrl-0 = <&cam_rear_mclk_default>, <&cam_rear_rst_default>;
+		pinctrl-names = "default";
+
+		avdd-supply = <&vreg_l14b_2p8>;
+		dvdd-supply = <&vreg_l1f_1p2>;
+		dovdd-supply = <&vreg_l2f_1p8>;
+		afvdd-supply = <&vreg_l16b_2p8>;
+
+		port {
+			cam_rear_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				/* 1324.8 Mbit/s per lane (vendor 4160x3120 @ 30 fps) */
+				link-frequencies = /bits/ 64 <662400000>;
+				remote-endpoint = <&csiphy4_ep>;
+			};
+		};
+	};
+
+	/* Front 8MP, SmartSens SC820CS */
+	camera_front: camera@10 {
+		compatible = "smartsens,sc820cs";
+		reg = <0x10>;
+
+		clocks = <&rpmhcc RPMH_DIV_CLK1>;
+
+		reset-gpios = <&pmh0110_g_e0_gpios 13 GPIO_ACTIVE_LOW>;
+
+		pinctrl-0 = <&cam_front_mclk_default>, <&cam_front_rst_default>;
+		pinctrl-names = "default";
+
+		avdd-supply = <&vreg_l14b_2p8>;
+		dvdd-supply = <&vreg_l1f_1p2>;
+		dovdd-supply = <&vreg_l2f_1p8>;
+
+		port {
+			cam_front_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				/* 660 Mbit/s per lane (vendor 3264x2448 @ 30 fps) */
+				link-frequencies = /bits/ 64 <330000000>;
+				remote-endpoint = <&csiphy5_ep>;
 			};
 		};
 	};
@@ -1224,9 +1315,53 @@
 	};
 };
 
+&pmh0110_g_e0_gpios {
+	/*
+	 * Camera reset lines (vendor "CAM_RESET1_1P8" / "CAM_RESET4"):
+	 * level is driven by the sensor driver, this only sets the pad
+	 * config. The vendor active state uses power-source 2, which this
+	 * PMIC's GPIO pads reject upstream (only VIN0/VIN1 exist), so use
+	 * the 1.8 V source like the other pmh0110 states on this board.
+	 */
+	cam_rear_rst_default: cam-rear-rst-default-state {
+		pins = "gpio14";
+		function = "normal";
+		input-disable;
+		output-enable;
+		power-source = <1>; /* 1.8V */
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
+	};
+
+	cam_front_rst_default: cam-front-rst-default-state {
+		pins = "gpio13";
+		function = "normal";
+		input-disable;
+		output-enable;
+		power-source = <1>; /* 1.8V */
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
+	};
+};
+
 &pmih0108_e1_eusb2_repeater {
 	vdd18-supply = <&vreg_l15b_1p8>;
 	vdd3-supply = <&vreg_l5b_3p1>;
+};
+
+&pmk8850_gpios {
+	/* 19.2 MHz camera MCLK outputs (RPMh DIV_CLK1 buffer, func2) */
+	cam_rear_mclk_default: cam-rear-mclk-default-state {
+		pins = "gpio2";
+		function = "func2";
+		output-enable;
+		power-source = <0>;
+	};
+
+	cam_front_mclk_default: cam-front-mclk-default-state {
+		pins = "gpio1";
+		function = "func2";
+		output-enable;
+		power-source = <0>;
+	};
 };
 
 &pon_resin {
