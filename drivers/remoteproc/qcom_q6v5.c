@@ -165,7 +165,13 @@ static irqreturn_t q6v5_handover_interrupt(int irq, void *data)
 	struct qcom_q6v5 *q6v5 = data;
 
 	if (q6v5->handover_issued) {
-		dev_err(q6v5->dev, "Handover signaled, but it already happened\n");
+		/*
+		 * Some firmware (e.g. the SM8850 ADSP) re-asserts the handover
+		 * SMP2P bit periodically; the reference driver handles repeats
+		 * without complaint. Keep the trace but out of the error log,
+		 * where it drowns everything else.
+		 */
+		dev_dbg(q6v5->dev, "handover re-signaled\n");
 		return IRQ_HANDLED;
 	}
 
