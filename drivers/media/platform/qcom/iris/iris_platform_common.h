@@ -39,6 +39,9 @@ struct iris_inst;
 #define MAX_HEVC_VBR_LAYER_HP_SLIDING_WINDOW	5
 #define MAX_HIER_CODING_LAYER_GEN1		6
 
+#define VIDEO_REGION_VM0_SECURE_NP_ID		1
+#define VIDEO_REGION_VM0_NONSECURE_NP_ID	5
+
 enum stage_type {
 	STAGE_1 = 1,
 	STAGE_2 = 2,
@@ -56,6 +59,7 @@ extern const struct iris_firmware_data iris_hfi_milos_data;
 
 extern const struct iris_platform_data milos_data;
 extern const struct iris_platform_data qcs8300_data;
+extern const struct iris_platform_data kaanapali_data;
 extern const struct iris_platform_data sc7280_data;
 extern const struct iris_platform_data sm8250_data;
 extern const struct iris_platform_data sm8550_data;
@@ -136,6 +140,12 @@ enum platform_inst_fw_cap_type {
 	FRAME_RC_ENABLE,
 	GOP_SIZE,
 	ENTROPY_MODE,
+	DEBLOCK_MODE_H264,
+	DEBLOCK_ALPHA_H264,
+	DEBLOCK_BETA_H264,
+	DEBLOCK_MODE_HEVC,
+	DEBLOCK_TC_HEVC,
+	DEBLOCK_BETA_HEVC,
 	MIN_FRAME_QP_H264,
 	MIN_FRAME_QP_HEVC,
 	MAX_FRAME_QP_H264,
@@ -186,6 +196,8 @@ enum platform_inst_fw_cap_type {
 	LAYER5_BITRATE_HEVC,
 	REQUEST_SYNC_FRAME,
 	TIME_DELTA_BASED_RC,
+	DISPLAY_DELAY_ENABLE,
+	DISPLAY_DELAY,
 	INST_FW_CAP_MAX,
 };
 
