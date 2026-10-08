@@ -782,10 +782,11 @@ static int sc_init_controls(struct sc_sensor *sc)
 	struct v4l2_ctrl_handler *hdl = &sc->ctrls;
 	const s64 *link_freq = chip == &sc1300cs_info ? sc1300cs_link_freq :
 							sc820cs_link_freq;
+	struct v4l2_fwnode_device_properties props;
 	struct v4l2_ctrl *ctrl;
 	int ret;
 
-	ret = v4l2_ctrl_handler_init(hdl, 7);
+	ret = v4l2_ctrl_handler_init(hdl, 9);
 	if (ret)
 		return ret;
 
@@ -825,13 +826,25 @@ static int sc_init_controls(struct sc_sensor *sc)
 
 	if (hdl->error) {
 		ret = hdl->error;
-		v4l2_ctrl_handler_free(hdl);
-		return ret;
+		goto err_free;
 	}
+
+	/* orientation/rotation from DT: libcamera derives Location from these */
+	ret = v4l2_fwnode_device_parse(sc->dev, &props);
+	if (ret)
+		goto err_free;
+
+	ret = v4l2_ctrl_new_fwnode_properties(hdl, &sc_ctrl_ops, &props);
+	if (ret)
+		goto err_free;
 
 	sc->sd.ctrl_handler = hdl;
 
 	return 0;
+
+err_free:
+	v4l2_ctrl_handler_free(hdl);
+	return ret;
 }
 
 static int sc_parse_endpoint(struct sc_sensor *sc)
