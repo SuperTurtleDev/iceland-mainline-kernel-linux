@@ -45,6 +45,12 @@
 #define DW9719_INFO			CCI_REG8(0)
 #define DW9719_ID			0xF1
 #define DW9761_ID			0xF4
+/*
+ * DW9714V in its register-mapped ("advanced") mode: IC INFO reads
+ * manufacturer 0xF / model 0xE and the CONTROL/VCM/STATUS/MODE/FREQ
+ * registers sit at the DW9719 offsets.
+ */
+#define DW9714V_ID			0xFE
 
 #define DW9719_CONTROL			CCI_REG8(2)
 #define DW9719_STANDBY			0x00
@@ -75,6 +81,7 @@
 #define to_dw9719_device(x) container_of(x, struct dw9719_device, sd)
 
 enum dw9719_model {
+	DW9714V,
 	DW9718S,
 	DW9719,
 	DW9761,
@@ -153,6 +160,12 @@ static int dw9719_power_up(struct dw9719_device *dw9719, bool detect)
 			return ret;
 
 		switch (val) {
+		case DW9714V_ID:
+			dw9719->model = DW9714V;
+			dw9719->mode_low_bits = 0x00;
+			dw9719->sac_mode = DW9719_DEFAULT_SAC;
+			dw9719->vcm_freq = DW9719_DEFAULT_VCM_FREQ;
+			break;
 		case DW9719_ID:
 			dw9719->model = DW9719;
 			dw9719->mode_low_bits = 0x00;
@@ -211,6 +224,7 @@ props:
 		cci_write(dw9719->regmap, DW9761_VCM_PRELOAD,
 			  DW9761_DEFAULT_VCM_PRELOAD, &ret);
 		fallthrough;
+	case DW9714V:
 	case DW9719:
 		cci_write(dw9719->regmap, DW9719_CONTROL, DW9719_ENABLE_RINGING, &ret);
 		cci_write(dw9719->regmap, DW9719_MODE, dw9719->mode_low_bits |
@@ -440,6 +454,7 @@ static void dw9719_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id dw9719_id_table[] = {
+	{ .name = "dw9714v", .driver_data = (kernel_ulong_t)DW9714V },
 	{ .name = "dw9718s", .driver_data = (kernel_ulong_t)DW9718S },
 	{ .name = "dw9719", .driver_data = (kernel_ulong_t)DW9719 },
 	{ .name = "dw9761", .driver_data = (kernel_ulong_t)DW9761 },
@@ -449,6 +464,7 @@ static const struct i2c_device_id dw9719_id_table[] = {
 MODULE_DEVICE_TABLE(i2c, dw9719_id_table);
 
 static const struct of_device_id dw9719_of_table[] = {
+	{ .compatible = "dongwoon,dw9714v", .data = (const void *)DW9714V },
 	{ .compatible = "dongwoon,dw9718s", .data = (const void *)DW9718S },
 	{ .compatible = "dongwoon,dw9719", .data = (const void *)DW9719 },
 	{ .compatible = "dongwoon,dw9761", .data = (const void *)DW9761 },
