@@ -588,6 +588,30 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 		val->intval = battmgr->status.current_now;
 		break;
 	case POWER_SUPPLY_PROP_POWER_NOW:
+		if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI) {
+			/*
+			 * The OPPO kaanapali battery firmware does not follow
+			 * the reference rate semantics: the raw value neither
+			 * scales with voltage*current nor tracks the load.
+			 * Compute the power from fresh voltage and current
+			 * readings instead, with the sign following the
+			 * battery current (positive while charging).
+			 */
+			ret = qcom_battmgr_bat_sm8350_update(battmgr,
+						     POWER_SUPPLY_PROP_VOLTAGE_NOW);
+			if (ret < 0)
+				return ret;
+			ret = qcom_battmgr_bat_sm8350_update(battmgr,
+						     POWER_SUPPLY_PROP_CURRENT_NOW);
+			if (ret < 0)
+				return ret;
+
+			/* uV * uA overflows 32 bits; result in uW */
+			val->intval = div_s64((s64)battmgr->status.voltage_now *
+					      battmgr->status.current_now,
+					      1000000);
+			break;
+		}
 		val->intval = battmgr->status.power_now;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
