@@ -306,9 +306,9 @@ static const u32 wb2_formats_rgb_yuv[] = {
 #define _DMA_SBLK_V13() \
 	{ \
 	.sspp_rec0_blk = {.name = "sspp_rec0", \
-		.base = 0x1000, .len = 0x180,},	\
+		.base = 0x1000, .len = 0x180,}, \
 	.sspp_rec1_blk = {.name = "sspp_rec1", \
-		.base = 0x3000, .len = 0x180,},	\
+		.base = 0x3000, .len = 0x180,}, \
 	.format_list = plane_formats, \
 	.num_formats = ARRAY_SIZE(plane_formats), \
 	}

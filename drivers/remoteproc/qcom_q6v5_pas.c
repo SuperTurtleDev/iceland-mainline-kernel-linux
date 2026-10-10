@@ -241,17 +241,14 @@ static int qcom_pas_load(struct rproc *rproc, const struct firmware *fw)
 		ret = qcom_mdt_pas_load(pas->dtb_pas_ctx, pas->dtb_firmware,
 					pas->dtb_firmware_name, pas->dtb_mem_region,
 					&pas->dtb_mem_reloc);
-		if (ret)
-			goto release_dtb_metadata;
+		if (ret) {
+			qcom_scm_pas_metadata_release(pas->dtb_pas_ctx);
+			release_firmware(pas->dtb_firmware);
+			return ret;
+		}
 	}
 
 	return 0;
-
-release_dtb_metadata:
-	qcom_scm_pas_metadata_release(pas->dtb_pas_ctx);
-	release_firmware(pas->dtb_firmware);
-
-	return ret;
 }
 
 static void qcom_pas_unmap_carveout(struct rproc *rproc, phys_addr_t mem_phys, size_t size)
@@ -510,10 +507,11 @@ static unsigned long qcom_pas_panic(struct rproc *rproc)
 
 static int qcom_pas_attach(struct rproc *rproc)
 {
-	int ret;
 	struct qcom_pas *pas = rproc->priv;
 	bool ready_state;
 	bool crash_state;
+	bool stop_state;
+	int ret;
 
 	pas->q6v5.handover_issued = true;
 	enable_irq(pas->q6v5.handover_irq);
@@ -521,7 +519,6 @@ static int qcom_pas_attach(struct rproc *rproc)
 	pas->q6v5.running = true;
 	ret = irq_get_irqchip_state(pas->q6v5.fatal_irq,
 				    IRQCHIP_STATE_LINE_LEVEL, &crash_state);
-
 	if (ret)
 		goto disable_running;
 
@@ -532,9 +529,18 @@ static int qcom_pas_attach(struct rproc *rproc)
 		goto disable_running;
 	}
 
+	ret = irq_get_irqchip_state(pas->q6v5.stop_irq,
+				    IRQCHIP_STATE_LINE_LEVEL, &stop_state);
+	if (ret)
+		goto disable_running;
+
+	if (stop_state || qcom_sysmon_shutdown_irq_state(pas->sysmon)) {
+		dev_info(pas->dev, "Subsystem found stop state set. Falling back to start.\n");
+		goto unroll_attach;
+	}
+
 	ret = irq_get_irqchip_state(pas->q6v5.ready_irq,
 				    IRQCHIP_STATE_LINE_LEVEL, &ready_state);
-
 	if (ret)
 		goto disable_running;
 
@@ -545,15 +551,16 @@ static int qcom_pas_attach(struct rproc *rproc)
 		 * start the remoteproc.
 		 */
 		dev_err(pas->dev, "Failed to get subsystem ready interrupt\n");
-		pas->rproc->state = RPROC_OFFLINE;
-		disable_irq(pas->q6v5.handover_irq);
-		ret = -EINVAL;
-		goto disable_running;
+		goto unroll_attach;
 	}
 
 	return 0;
 
+unroll_attach:
+	pas->rproc->state = RPROC_OFFLINE;
+	ret = -EINVAL;
 disable_running:
+	disable_irq(pas->q6v5.handover_irq);
 	pas->q6v5.running = false;
 
 	return ret;
