@@ -571,6 +571,30 @@ static const struct drm_display_mode csot_ppd200ub2_modes[] = {
 		.vtotal = 2400 + 2726 + 2 + 272,
 	},
 	{
+		/* 50Hz */
+		.clock = (3392 + 420 + 160 + 320) * (2400 + 2010 + 2 + 52) * 50 / 1000,
+		.hdisplay = 3392,
+		.hsync_start = 3392 + 420,
+		.hsync_end = 3392 + 420 + 160,
+		.htotal = 3392 + 420 + 160 + 320,
+		.vdisplay = 2400,
+		.vsync_start = 2400 + 2010,
+		.vsync_end = 2400 + 2010 + 2,
+		.vtotal = 2400 + 2010 + 2 + 52,
+	},
+	{
+		/* 48Hz */
+		.clock = (3392 + 420 + 160 + 320) * (2400 + 2196 + 2 + 52) * 48 / 1000,
+		.hdisplay = 3392,
+		.hsync_start = 3392 + 420,
+		.hsync_end = 3392 + 420 + 160,
+		.htotal = 3392 + 420 + 160 + 320,
+		.vdisplay = 2400,
+		.vsync_start = 2400 + 2196,
+		.vsync_end = 2400 + 2196 + 2,
+		.vtotal = 2400 + 2196 + 2 + 52,
+	},
+	{
 		/* 30Hz */
 		.clock = (3392 + 100 + 64 + 104) * (2400 + 8126 + 2 + 272) * 30 / 1000,
 		.hdisplay = 3392,
