@@ -217,13 +217,6 @@ static int iceland_csot_init_sequence(struct panel_info *pinfo)
 }
 
 static const struct drm_display_mode iceland_csot_modes[] = {
-	/*
-	 * The downstream 144Hz timing (hfp 68, hsync 32, hbp 40, vfp 26, vbp 52)
-	 * is deliberately absent: its 1261 MHz pixel clock needs a 662 MHz DPU
-	 * core clock (mode clock * 105% / 2 with the 3D merge), above the 650 MHz
-	 * MDP ceiling in the kaanapali dispcc clock plan, so dpu_crtc_mode_valid()
-	 * prunes it from the connector mode list anyway.
-	 */
 	{
 		/* 120Hz */
 		.clock = (3392 + 100 + 64 + 104) * (2400 + 26 + 2 + 272) * 120 / 1000,
@@ -235,6 +228,24 @@ static const struct drm_display_mode iceland_csot_modes[] = {
 		.vsync_start = 2400 + 26,
 		.vsync_end = 2400 + 26 + 2,
 		.vtotal = 2400 + 26 + 2 + 272,
+	},
+	{
+		/*
+		 * 144Hz: own pixel-clock family (1261 MHz, vendor DFPS list
+		 * value), so a switch to/from it relocks the DSI PLL through the
+		 * full modeset path.  Needs the 100% (not 105%) core-clock
+		 * efficiency in the kaanapali DPU catalog, see
+		 * dpu_13_0_kaanapali.h.
+		 */
+		.clock = (3392 + 68 + 32 + 40) * (2400 + 26 + 2 + 52) * 144 / 1000,
+		.hdisplay = 3392,
+		.hsync_start = 3392 + 68,
+		.hsync_end = 3392 + 68 + 32,
+		.htotal = 3392 + 68 + 32 + 40,
+		.vdisplay = 2400,
+		.vsync_start = 2400 + 26,
+		.vsync_end = 2400 + 26 + 2,
+		.vtotal = 2400 + 26 + 2 + 52,
 	},
 	{
 		/* 90Hz */

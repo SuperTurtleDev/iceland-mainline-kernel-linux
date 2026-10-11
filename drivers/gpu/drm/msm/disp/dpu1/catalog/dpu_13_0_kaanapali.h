@@ -449,7 +449,17 @@ static const struct dpu_perf_cfg kaanapali_perf_data = {
 		{.rd_enable = 1, .wr_enable = 1},
 		{.rd_enable = 1, .wr_enable = 0}
 	},
-	.clk_inefficiency_factor = 105,
+	/*
+	 * 100 instead of the generic 105: with 105 the only mode above
+	 * 120Hz on the iceland panel (144Hz, 1261 MHz pixel clock) needs a
+	 * 662 MHz core clock, above the 650 MHz MDP ceiling of the kaanapali
+	 * dispcc clock plan, and is pruned by dpu_crtc_mode_valid().  The
+	 * downstream clock plan has the same 650 MHz ceiling and still ships
+	 * 144Hz (per-LM pixel rate 631 MHz, ~3% margin), so drop the extra
+	 * fudge.  If the margin turns out to be real, it shows up as DPU
+	 * fifo underruns at 144Hz - not as a pruned mode.
+	 */
+	.clk_inefficiency_factor = 100,
 	.bw_inefficiency_factor = 120,
 };
 
