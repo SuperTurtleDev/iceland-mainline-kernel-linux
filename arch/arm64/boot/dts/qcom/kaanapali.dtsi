@@ -4783,6 +4783,8 @@
 				function = "gpio";
 				input-enable;
 				bias-disable;
+				/* hand TLMM ownership to the remote (SEE/ADSP) */
+				qcom,remote;
 			};
 
 			qup_i2c10_data_clk: qup-i2c10-data-clk-state {
