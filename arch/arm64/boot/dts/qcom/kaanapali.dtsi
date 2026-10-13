@@ -523,6 +523,18 @@
 		};
 	};
 
+	/*
+	 * Camera shared I2C bus (QUP wrap2 SE1, gpio4/5) is physically
+	 * shared with the SEE on the ADSP.  Boards that route their camera
+	 * sensors through it enable this adapter; the referenced geni i2c
+	 * SE provides the transfers, pins default to high-Z so the SEE can
+	 * own the bus, and transfers return -EBUSY while it does.
+	 */
+	oplus_camres: camres {
+		compatible = "oplus,camres";
+		status = "disabled";
+	};
+
 	smp2p-adsp {
 		compatible = "qcom,smp2p";
 
@@ -4764,6 +4776,13 @@
 				function = "qup2_se1";
 				drive-strength = <2>;
 				bias-pull-up;
+			};
+
+			qup_i2c9_release: qup-i2c9-release-state {
+				pins = "gpio4", "gpio5";
+				function = "gpio";
+				input-enable;
+				bias-disable;
 			};
 
 			qup_i2c10_data_clk: qup-i2c10-data-clk-state {
