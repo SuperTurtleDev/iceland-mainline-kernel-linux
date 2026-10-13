@@ -1710,7 +1710,7 @@
 	status = "okay";
 
 	keyboard {
-		compatible = "oneplus,pogo-keyboard";
+		compatible = "oneplus,iceland-pogo-keyboard";
 
 		pinctrl-0 = <&pogo_kbd_wake_default>,
 			    <&pogo_kbd_power_default>,
@@ -1720,9 +1720,6 @@
 		power-gpios = <&pmh0110_f_e0_gpios 12 GPIO_ACTIVE_HIGH>;
 		tx-enable-gpios = <&pmh0110_d_e0_gpios 6 GPIO_ACTIVE_HIGH>;
 		wake-gpios = <&tlmm 151 GPIO_ACTIVE_LOW>;
-
-		touchpad-xy-max = <2560 1440>;
-		touchpad-xy-resolution = <24 25>;
 	};
 };
 
