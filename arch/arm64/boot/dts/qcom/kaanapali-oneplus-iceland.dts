@@ -1042,19 +1042,41 @@
 	};
 };
 
+/*
+ * Camera I2C bus (QUP wrap2 SE1) is physically shared with the SEE
+ * (ADSP), which owns it by default for AON/virtual camera sensors.
+ * geni_i2c stays disabled: oplus_camres below instantiates it from
+ * this node only while the AP holds the bus, so the SE is untouched
+ * (no firmware load, no interconnect votes) whenever SEE owns it.
+ */
 &i2c9 {
-	clock-frequency = <400000>;
+	status = "disabled";
+
+	/* the dynamically-created geni device must not claim gpio4/5:
+	 * camres owns the pin states for the shared bus */
+	/delete-property/ pinctrl-0;
+	/delete-property/ pinctrl-names;
+};
+
+/*
+ * The special camera i2c bus: camera sensor/VCM children hang here.
+ * Released to the SEE by default; write 1 to force_start_i2c (after
+ * userspace has told SEE to let go) to start I2C on the AP side.
+ */
+&oplus_camres {
+	compatible = "oplus,camres";
+	i2c-bus = <&i2c9>;
+
+	/* camera_handshake SUID (SEE SUID registry) */
+	sns,suid-hi = /bits/ 64 <0xa7167528f835f4ee>;
+	sns,suid-lo = /bits/ 64 <0xe0e3f77b504b96a1>;
+
+	pinctrl-names = "active", "released";
+	pinctrl-0 = <&qup_i2c9_data_clk>;
+	pinctrl-1 = <&qup_i2c9_release>;
 
 	status = "okay";
 
-	/*
-	 * Camera sensors are plain GENI I2C devices on SE9 (not CCI).
-	 * Vendor DT uses 8-bit addresses: rear 0x6c, front 0x20.
-	 * Both share one 19.2 MHz RPMh clock (DIV_CLK1), routed out on
-	 * PMK8850 GPIO2 (rear) / GPIO1 (front) in func2.
-	 */
-
-	/* Rear 13MP, SmartSens SC1300CS */
 	camera_rear: camera@36 {
 		compatible = "smartsens,sc1300cs";
 		reg = <0x36>;
@@ -1075,7 +1097,6 @@
 		afvdd-supply = <&vreg_l16b_2p8>;
 
 		flash-leds = <&pmh0101_flash_led0>;
-		lens-focus = <&camera_rear_vcm>;
 
 		port {
 			cam_rear_ep: endpoint {
@@ -1092,12 +1113,12 @@
 	 * it powers up in its register-mapped mode, served by the dw9719
 	 * driver. Vendor 8-bit address 0x18.
 	 */
-	camera_rear_vcm: camera-lens@c {
-		compatible = "dongwoon,dw9714v";
-		reg = <0x0c>;
+		camera_rear_vcm: camera-lens@c {
+			compatible = "dongwoon,dw9714v";
+			reg = <0x0c>;
 
-		vdd-supply = <&vreg_l16b_2p8>;
-	};
+			vdd-supply = <&vreg_l16b_2p8>;
+		};
 
 	/* Front 8MP, SmartSens SC820CS */
 	camera_front: camera@10 {
