@@ -30,6 +30,12 @@
  *                   answer REVOKE, and AON commands die after it]
  *       release:   RELEASE 0x241 {0}      -> ACK 0x341
  *
+ *     When INIT is ACKed with an error instead (module .pb missing)
+ *     there is no session to arbitrate: the AON subscribe still runs
+ *     (it powers the module), but the bus is taken once and held to
+ *     the AP for good — acquire/release become no-ops until SEE
+ *     restarts and the classification is re-made.
+ *
  *     The sequence is ACK-driven: each request blocks until its ACK
  *     indication arrives (or times out); there are no sleeps.
  *
@@ -38,10 +44,8 @@
  * that does not match is dropped with a reason and hex logged.
  *
  * sysfs:
- *   force_start_i2c        — A: kernel negotiates with SEE, then takes
+ *   force_start_i2c        — kernel negotiates with SEE, then takes
  *                            the bus.  Write 0 to drop the hold.
- *   force_start_i2c_direct — B: take the bus with no SEE calls at all
- *                            (userspace is responsible for them).
  *   ap_holds               — read current ownership (1 = AP)
  */
 
@@ -228,7 +232,6 @@ struct oplus_camres {
 	struct mutex lock;
 	atomic_t consumers;
 	bool force;		/* sysfs hold active */
-	bool sns_quiet;		/* mode B: skip SEE calls */
 	bool ap_active;		/* pins muxed + geni instantiated */
 
 	struct pinctrl *pctl;
@@ -855,6 +858,8 @@ static void sns_release_notify(struct oplus_camres *cr)
 
 /* ---- SEE camera session readiness ---- */
 
+static int takeover_locked(struct oplus_camres *cr, bool negotiate);
+
 static int camres_reprobe_child(struct device *dev, void *data)
 {
 	int ret;
@@ -955,6 +960,21 @@ static void session_work_fn(struct work_struct *work)
 	}
 	cr->aon_armed = true;
 	cr->session_ready = true;
+	if (!cr->hs_ok) {
+		/*
+		 * Classified as no-PB (INIT answered with an error):
+		 * SEE arbitration is impossible — REVOKE/RELEASE have no
+		 * session to act on.  The AON subscribe above is the only
+		 * SEE dependency left (it powers the module) and stands;
+		 * take the bus once, hold it for good, and let
+		 * acquire/release reduce to no-ops (release_work checks
+		 * the same hs_ready && !hs_ok condition).
+		 */
+		dev_info(cr->dev, "no SEE handshake: camera bus held to AP\n");
+		ret = takeover_locked(cr, false);
+		if (ret)
+			dev_warn(cr->dev, "AP hold failed (%d)\n", ret);
+	}
 	mutex_unlock(&cr->lock);
 
 	camres_session_up(cr);
@@ -1168,7 +1188,7 @@ static int release_locked(struct oplus_camres *cr)
 	geni_destroy(cr);
 
 	dev_info(cr->dev, "camera bus released to SEE\n");
-	if (!cr->sns_quiet && cr->hs_ok)
+	if (cr->hs_ok)
 		sns_release_notify(cr);
 	camres_uevent(cr, "SEE");
 	/*
@@ -1187,7 +1207,9 @@ static void release_work_fn(struct work_struct *work)
 					       release_work);
 
 	mutex_lock(&cr->lock);
-	if (!atomic_read(&cr->consumers) && !cr->force && cr->ap_active) {
+	/* no-PB (hs_ready && !hs_ok): the bus stays with the AP for good */
+	if (!atomic_read(&cr->consumers) && !cr->force && cr->ap_active &&
+	    !(cr->hs_ready && !cr->hs_ok)) {
 		if (release_locked(cr))
 			schedule_delayed_work(&cr->release_work,
 					      msecs_to_jiffies(200));
@@ -1280,14 +1302,13 @@ EXPORT_SYMBOL_GPL(oplus_camres_is_ready);
 
 /* ---- sysfs ---- */
 
-static int force_set(struct oplus_camres *cr, bool val, bool direct)
+static int force_set(struct oplus_camres *cr, bool val)
 {
 	int ret = 0;
 
 	if (val && !cr->force) {
 		cr->force = true;
-		cr->sns_quiet = direct;
-		ret = takeover_locked(cr, !direct);
+		ret = takeover_locked(cr, true);
 		if (ret)
 			cr->force = false;
 	} else if (!val && cr->force) {
@@ -1303,7 +1324,7 @@ static ssize_t force_start_i2c_show(struct device *dev,
 {
 	struct oplus_camres *cr = dev_get_drvdata(dev);
 
-	return sysfs_emit(buf, "%d\n", cr->force && !cr->sns_quiet);
+	return sysfs_emit(buf, "%d\n", cr->force);
 }
 
 static ssize_t force_start_i2c_store(struct device *dev,
@@ -1323,46 +1344,12 @@ static ssize_t force_start_i2c_store(struct device *dev,
 		return ret;
 
 	mutex_lock(&cr->lock);
-	ret = force_set(cr, val, false);
+	ret = force_set(cr, val);
 	mutex_unlock(&cr->lock);
 	return ret ? ret : count;
 }
 static struct device_attribute dev_attr_force_start_i2c =
 	__ATTR(force_start_i2c, 0600, force_start_i2c_show, force_start_i2c_store);
-
-static ssize_t force_start_i2c_direct_show(struct device *dev,
-					   struct device_attribute *attr,
-					   char *buf)
-{
-	struct oplus_camres *cr = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%d\n", cr->force && cr->sns_quiet);
-}
-
-static ssize_t force_start_i2c_direct_store(struct device *dev,
-					    struct device_attribute *attr,
-					    const char *buf, size_t count)
-{
-	struct oplus_camres *cr = dev_get_drvdata(dev);
-	bool val;
-	int ret;
-
-	/* taking the bus from the SEE is a privileged operation */
-	if (!capable(CAP_SYS_ADMIN))
-		return -EPERM;
-
-	ret = kstrtobool(buf, &val);
-	if (ret)
-		return ret;
-
-	mutex_lock(&cr->lock);
-	ret = force_set(cr, val, true);
-	mutex_unlock(&cr->lock);
-	return ret ? ret : count;
-}
-static struct device_attribute dev_attr_force_start_i2c_direct =
-	__ATTR(force_start_i2c_direct, 0600,
-	       force_start_i2c_direct_show, force_start_i2c_direct_store);
 
 static ssize_t ap_holds_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
@@ -1373,7 +1360,6 @@ static DEVICE_ATTR_RO(ap_holds);
 
 static struct attribute *camres_attrs[] = {
 	&dev_attr_force_start_i2c.attr,
-	&dev_attr_force_start_i2c_direct.attr,
 	&dev_attr_ap_holds.attr,
 	NULL,
 };
