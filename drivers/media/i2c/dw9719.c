@@ -10,6 +10,7 @@
 
 #include <linux/delay.h>
 #include <linux/i2c.h>
+#include <linux/oplus-camres.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 #include <linux/types.h>
@@ -110,6 +111,7 @@ struct dw9719_device {
 static int dw9719_power_down(struct dw9719_device *dw9719)
 {
 	u32 reg_pwr = dw9719->model == DW9718S ? DW9718S_PD : DW9719_CONTROL;
+	int ret;
 
 	/*
 	 * Worth engaging the internal SHUTDOWN mode especially due to the
@@ -117,7 +119,11 @@ static int dw9719_power_down(struct dw9719_device *dw9719)
 	 */
 	if (cci_write(dw9719->regmap, reg_pwr, DW9719_SHUTDOWN, NULL))
 		dev_err(dw9719->dev, "Error writing to power register\n");
-	return regulator_disable(dw9719->regulator);
+	ret = regulator_disable(dw9719->regulator);
+
+	/* last I2C is done: hand the shared bus back to SEE */
+	oplus_camres_release(dw9719->dev);
+	return ret;
 }
 
 static int dw9719_power_up(struct dw9719_device *dw9719, bool detect)
@@ -127,9 +133,14 @@ static int dw9719_power_up(struct dw9719_device *dw9719, bool detect)
 	int ret;
 	int err;
 
-	ret = regulator_enable(dw9719->regulator);
+	/* the bus is SEE-owned by default: take it before any I2C */
+	ret = oplus_camres_acquire(dw9719->dev);
 	if (ret)
 		return ret;
+
+	ret = regulator_enable(dw9719->regulator);
+	if (ret)
+		goto err_release;
 
 	/*
 	 * Need 100us to transition from SHUTDOWN to STANDBY.
@@ -160,7 +171,7 @@ static int dw9719_power_up(struct dw9719_device *dw9719, bool detect)
 
 		ret = cci_read(dw9719->regmap, DW9719_INFO, &val, NULL);
 		if (ret < 0)
-			return ret;
+			goto err_power_down;
 
 		switch (val) {
 		case DW9714V_ID:
@@ -183,7 +194,8 @@ static int dw9719_power_up(struct dw9719_device *dw9719, bool detect)
 		default:
 			dev_err(dw9719->dev,
 				"Error unknown device id 0x%02llx\n", val);
-			return -ENXIO;
+			ret = -ENXIO;
+			goto err_power_down;
 		}
 
 props:
@@ -235,8 +247,15 @@ props:
 	}
 
 	if (ret)
-		dw9719_power_down(dw9719);
+		goto err_power_down;
 
+	return 0;
+
+err_power_down:
+	dw9719_power_down(dw9719);	/* also hands the bus back */
+	return ret;
+err_release:
+	oplus_camres_release(dw9719->dev);
 	return ret;
 }
 
@@ -408,6 +427,12 @@ static int dw9719_probe(struct i2c_client *client)
 	 * runtime pm is disabled this will leave the chip on, so that the lens
 	 * will work.
 	 */
+
+	/* camres reprobes us once SEE hands out the shared bus */
+	if (!oplus_camres_is_ready()) {
+		ret = -EPROBE_DEFER;
+		goto err_cleanup_media;
+	}
 
 	ret = dw9719_power_up(dw9719, true);
 	if (ret)

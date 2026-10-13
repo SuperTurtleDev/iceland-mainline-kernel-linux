@@ -17,6 +17,7 @@
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/oplus-camres.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 #include <linux/units.h>
@@ -433,10 +434,15 @@ static int sc_power_on(struct device *dev)
 	struct sc_sensor *sc = to_sc(sd);
 	int ret;
 
+	/* the bus is SEE-owned by default: take it before any I2C */
+	ret = oplus_camres_acquire(dev);
+	if (ret)
+		return ret;
+
 	ret = regulator_bulk_enable(sc->chip->num_supplies, sc->supplies);
 	if (ret) {
 		dev_err(dev, "failed to enable regulators: %d\n", ret);
-		return ret;
+		goto err_bus;
 	}
 
 	/* let the rails settle before clocking the sensor */
@@ -460,6 +466,8 @@ static int sc_power_on(struct device *dev)
 
 err_reg:
 	regulator_bulk_disable(sc->chip->num_supplies, sc->supplies);
+err_bus:
+	oplus_camres_release(dev);
 	return ret;
 }
 
@@ -472,6 +480,9 @@ static int sc_power_off(struct device *dev)
 	fsleep(1000);
 	clk_disable_unprepare(sc->mclk);
 	regulator_bulk_disable(sc->chip->num_supplies, sc->supplies);
+
+	/* last I2C is done: hand the bus back to SEE */
+	oplus_camres_release(dev);
 
 	return 0;
 }
@@ -939,6 +950,10 @@ static int sc_probe(struct i2c_client *client)
 	v4l2_i2c_subdev_init(&sc->sd, client, &sc_subdev_ops);
 	snprintf(sc->sd.name, sizeof(sc->sd.name), "%s %d-%04x",
 		 sc->chip->name, i2c_adapter_id(client->adapter), client->addr);
+
+	/* camres reprobes us once SEE hands out the shared bus */
+	if (!oplus_camres_is_ready())
+		return -EPROBE_DEFER;
 
 	ret = sc_power_on(dev);
 	if (ret)
