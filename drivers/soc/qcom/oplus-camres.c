@@ -20,16 +20,22 @@
  *
  *       registration (once, at service discovery):
  *           SUID lookup (msg 512, magic uid) -> 768
- *       takeover:  INIT 0x240 {name, 0, slot}  -> ACK 0x340 (error==0)
- *                  REVOKE 0x243 {}             -> ACK 0x343   [optional]
- *       release:   RELEASE 0x241 {0}           -> ACK 0x341
+ *       session bring-up (retried until SEE answers; the AON subscribe
+ *           powers the camera module — once, and kept standing):
+ *           INIT 0x240 {name, 0, slot}   -> ACK 0x340 (error==0)
+ *           RELEASE 0x241 {0}            -> ACK 0x341
+ *           AON subscribe 516 + 513{cfg} -> camera_oplus_aon, ACK 0x20D
+ *       takeover:  REVOKE 0x243 {}        -> ACK 0x343
+ *                  [only while the AON subscribe stands: SEE does not
+ *                   answer REVOKE, and AON commands die after it]
+ *       release:   RELEASE 0x241 {0}      -> ACK 0x341
  *
  *     The sequence is ACK-driven: each request blocks until its ACK
  *     indication arrives (or times out); there are no sleeps.
  *
  * All SNS/QRTR/QMI wire layouts are fixed on this firmware and are
  * described by packed structs that are validated strictly — a datagram
- * that does not match is dropped with a reason logged.
+ * that does not match is dropped with a reason and hex logged.
  *
  * sysfs:
  *   force_start_i2c        — A: kernel negotiates with SEE, then takes
@@ -76,11 +82,14 @@
 #define SNS_MSG_SUID_RESULT	768
 #define SNS_SUID_MAGIC		0xababababababababULL
 
-/* SNS std sensor enable flow on camera_oplus_aon (captured vendor
- * sequence): attributes request (516, empty), then config (513) with
- * {320x240 @ 5 fps} — this brings the camera power domain up. */
+/* camera_oplus_aon subscribe (captured vendor sequence; on the wire
+ * these are the qsh_camera_oplus 0x204 algo query and 0x201 sensor
+ * subscribe): attributes request (516, empty), then config (513) with
+ * {320x240 @ 5 fps} — this is what powers the camera module, and its
+ * ACK 0x20D (error==0) is the precondition for REVOKE. */
 #define SNS_MSG_SENSOR_INFO	516
 #define SNS_MSG_SENSOR_CONFIG	513
+#define SNS_MSG_SENSOR_CONFIG_ACK 0x20D
 #define SNS_AON_UID_LO		0xf8447cc60209c100ULL
 #define SNS_AON_UID_HI		0x3e9145ace8717480ULL
 
@@ -195,6 +204,22 @@ struct camres_sns_ack_tail {
 
 #define ACK_TAIL_LEN		(5 + sizeof(struct camres_sns_ack_tail))
 
+/*
+ * REVOKE ack tail (0x343): same {2: ts, 3: {...}} envelope as the
+ * other handshake acks, but field 3 carries {1: error, 5..8:
+ * optional AON stats blobs} instead of a nested power/state
+ * submessage (captured: body 22, err_len 6 = "08 00" + "3a 02 08 00").
+ * Only the fixed prefix is validated; the stats blobs are ignored.
+ */
+struct camres_sns_revoke_tail {
+	u8 ts_tag;			/* PB_F64(2) */
+	u8 ts[8];
+	u8 err_tag;			/* PB_BYTES(3) */
+	u8 err_len;			/* >= 2, grows with stats blobs */
+	u8 error_tag;			/* PB_VARINT(1) */
+	u8 error;
+} __packed;
+
 /* ---- driver state ---- */
 
 struct oplus_camres {
@@ -232,7 +257,10 @@ struct oplus_camres {
 	struct sockaddr_qrtr sns_sq;
 	bool sns_found;
 	bool registered;	/* SNS client registered (ADSP up) */
-	bool session_ready;	/* SEE camera handshake answered */
+	bool hs_ready;		/* INIT answered once (bring-up step 1) */
+	bool hs_ok;		/* handshake session valid (INIT error==0) */
+	bool aon_armed;		/* AON subscribe acked — REVOKE precondition */
+	bool session_ready;	/* SEE camera session up (module powered) */
 	u16 txn;
 	u64 suid_hi;
 	u64 suid_lo;
@@ -468,16 +496,35 @@ static int sns_parse_ack(const u8 *buf, size_t len, u64 uid_lo, u64 uid_hi,
 		if (pb_len != sizeof(*resp) + sizeof(*t))
 			return -13;
 		t = (const void *)(resp + 1);
-		if (t->ts_tag != PB_F64(2) || t->err_tag != PB_BYTES(3) ||
-		    t->err_len != 6 || t->error_tag != PB_VARINT(1) ||
-		    t->state_tag != PB_BYTES(2) || t->state_len != 2 ||
-		    t->state_val_tag != PB_VARINT(1))
+		if (t->ts_tag == PB_F64(2) && t->err_tag == PB_BYTES(3) &&
+		    t->err_len == 6 && t->error_tag == PB_VARINT(1) &&
+		    t->state_tag == PB_BYTES(2) && t->state_len == 2 &&
+		    t->state_val_tag == PB_VARINT(1)) {
+			*tail = *t;
+			return 0;
+		}
+		if (expect != QSH_REVOKE_ACK)
 			return -14;
-		*tail = *t;
-	} else {
-		/* registry reply shape: no error/state tail */
-		memset(tail, 0, sizeof(*tail));
 	}
+
+	if (expect == QSH_REVOKE_ACK) {
+		const struct camres_sns_revoke_tail *t;
+
+		/* {2: ts, 3: {1: error, 5..8: optional stats}} */
+		if (resp->body_len < 5 + sizeof(*t) ||
+		    pb_len < sizeof(*resp) + sizeof(*t))
+			return -15;
+		t = (const void *)(resp + 1);
+		if (t->ts_tag != PB_F64(2) || t->err_tag != PB_BYTES(3) ||
+		    t->err_len < 2 || t->error_tag != PB_VARINT(1))
+			return -16;
+		memset(tail, 0, sizeof(*tail));
+		tail->error = t->error;
+		return 0;
+	}
+
+	/* registry reply shape: no error/state tail */
+	memset(tail, 0, sizeof(*tail));
 	return 0;
 }
 
@@ -517,8 +564,11 @@ static void camres_rx_ack(struct oplus_camres *cr, const u8 *buf, size_t len)
 	complete(&cr->ack_done);
 out:
 	spin_unlock(&cr->ack_lock);
-	if (ret)
+	if (ret) {
 		dev_dbg(cr->dev, "sns datagram dropped (reason %d)\n", ret);
+		print_hex_dump_debug("sns drop: ", DUMP_PREFIX_OFFSET, 16, 1,
+				     buf, min_t(size_t, len, 128), true);
+	}
 }
 
 /*
@@ -682,8 +732,12 @@ static bool camres_parse_ctrl(struct oplus_camres *cr, const u8 *buf,
 		   cr->sns_sq.sq_node == node && cr->sns_sq.sq_port == port) {
 		bool was_ready = cr->session_ready;
 
+		dev_info(cr->dev, "SEE service restart\n");
 		cr->sns_found = false;
 		cr->registered = false;		/* SEE restart drops it */
+		cr->hs_ready = false;
+		cr->hs_ok = false;
+		cr->aon_armed = false;
 		cr->session_ready = false;
 		if (was_ready)
 			kobject_uevent_env(&cr->dev->kobj, KOBJ_CHANGE,
@@ -741,7 +795,10 @@ static int sns_simple(struct oplus_camres *cr, u32 msg, u32 ack,
 
 /*
  * Enable the AON camera sensor on SEE (vendor-captured sequence): this
- * is what powers the camera module.  Fire-and-forget — the sensor
+ * is what powers the camera module, once, at session bring-up.  The
+ * subscribe is kept standing for the whole session — its ACK (0x20D,
+ * error==0) is also the precondition for REVOKE, and after a successful
+ * REVOKE the SEE side no longer accepts AON requests.  The sensor
  * streams asynchronously via report indications we do not consume.
  */
 /*
@@ -759,7 +816,7 @@ struct camres_sns_aon_cfg {
 	u8 f7_tag;	u8 f7;
 } __packed;
 
-static void sns_aon_power_on(struct oplus_camres *cr)
+static int sns_aon_power_on(struct oplus_camres *cr)
 {
 	static const struct camres_sns_aon_cfg cfg = {
 		.res_w_tag = PB_VARINT(1),	.res_w = { 0xc0, 0x02 },
@@ -772,12 +829,15 @@ static void sns_aon_power_on(struct oplus_camres *cr)
 	};
 	int ret;
 
+	/* attributes request first; reply is an asynchronous event */
 	ret = sns_send(cr, SNS_AON_UID_LO, SNS_AON_UID_HI,
 		       SNS_MSG_SENSOR_INFO, NULL, 0);
 	if (ret)
-		return;
-	sns_send(cr, SNS_AON_UID_LO, SNS_AON_UID_HI,
-		 SNS_MSG_SENSOR_CONFIG, (const u8 *)&cfg, sizeof(cfg));
+		return ret;
+
+	return sns_xfer(cr, SNS_AON_UID_LO, SNS_AON_UID_HI,
+			SNS_MSG_SENSOR_CONFIG, (const u8 *)&cfg, sizeof(cfg),
+			SNS_MSG_SENSOR_CONFIG_ACK);
 }
 
 /* tell SEE the AP is done with the camera (power off) */
@@ -823,8 +883,14 @@ static void camres_session_up(struct oplus_camres *cr)
 /*
  * SNS registration only proves the ADSP is up.  SEE does not answer the
  * camera handshake until adsprpcd has served its camera config, so poll
- * the attach here and declare readiness only once it is acked (or once
- * a takeover already holds the bus, which proves the same thing).
+ * here until it does:
+ *
+ *   - INIT without any ACK: adsprpcd is not serving yet — retry.
+ *   - INIT ACKed with an error (e.g. the module .pb is missing): the
+ *     service is alive — continue; vendor tolerates this too.
+ *   - AON subscribe acked: the module is powered and REVOKE is armed.
+ *
+ * Each step is retried on its own; completed steps are not redone.
  */
 static void session_work_fn(struct work_struct *work)
 {
@@ -837,21 +903,57 @@ static void session_work_fn(struct work_struct *work)
 	if (cr->session_ready)
 		goto out_unlock;
 
-	if (!cr->ap_active) {
-		if (!cr->registered)
-			goto out_unlock;	/* lookup_work reschedules us */
+	if (cr->ap_active) {
+		/*
+		 * AP holds the bus: SEE would reject the AON subscribe
+		 * ("camera is acquired").  release_locked re-arms the
+		 * session once the bus is handed back — do not claim
+		 * readiness without the subscribe standing.
+		 */
+		goto out_unlock;
+	}
 
+	if (!cr->registered)
+		goto out_unlock;	/* lookup_work reschedules us */
+
+	if (!cr->hs_ready) {
 		ret = sns_attach(cr);
-		if (ret) {
+		if (ret == -ETIMEDOUT) {
 			mutex_unlock(&cr->lock);
 			dev_info(cr->dev,
-				 "SEE camera session not up yet (%d)\n", ret);
+				 "SEE camera session not up yet (%d)\n",
+				 ret);
 			schedule_delayed_work(&cr->session_work,
 					      msecs_to_jiffies(SESSION_RETRY_MS));
 			return;
 		}
-		sns_release_notify(cr);
+		if (!ret) {
+			sns_release_notify(cr);
+			cr->hs_ok = true;
+		} else {
+			/*
+			 * ACKed with an error: the service answered,
+			 * only its config is short (no module .pb) —
+			 * keep going, but without a valid session
+			 * REVOKE/RELEASE must not be sent.
+			 */
+			dev_warn(cr->dev,
+				 "SEE attach rejected (%d): continuing\n",
+				 ret);
+		}
+		cr->hs_ready = true;
 	}
+
+	ret = sns_aon_power_on(cr);
+	if (ret) {
+		mutex_unlock(&cr->lock);
+		dev_info(cr->dev,
+			 "SEE AON subscribe not up yet (%d)\n", ret);
+		schedule_delayed_work(&cr->session_work,
+				      msecs_to_jiffies(SESSION_RETRY_MS));
+		return;
+	}
+	cr->aon_armed = true;
 	cr->session_ready = true;
 	mutex_unlock(&cr->lock);
 
@@ -978,20 +1080,34 @@ static int takeover_locked(struct oplus_camres *cr, bool negotiate)
 		return 0;
 
 	if (negotiate) {
-		ret = sns_attach(cr);
-		if (ret) {
-			dev_warn(cr->dev, "SEE attach failed (%d)\n", ret);
-			return ret;
+		if (!cr->session_ready) {
+			dev_warn(cr->dev, "SEE session not ready\n");
+			return -ENOTCONN;
 		}
+		/*
+		 * The AON subscribe that powers the module happened at
+		 * session bring-up and stays standing; REVOKE is only
+		 * answerable while it does, and only from a valid
+		 * handshake session — an out-of-session REVOKE takes the
+		 * SEE service down with it.  AON requests die after a
+		 * successful REVOKE, so there is nothing to (re)enable.
+		 */
 		if (revoke) {
-			ret = sns_simple(cr, QSH_REVOKE, QSH_REVOKE_ACK,
-					 NULL, 0);
-			if (ret)
-				dev_warn(cr->dev, "SEE revoke failed (%d)\n",
-					 ret);
+			if (!cr->aon_armed) {
+				dev_info(cr->dev,
+					 "SEE revoke skipped: AON not subscribed\n");
+			} else if (!cr->hs_ok) {
+				dev_info(cr->dev,
+					 "SEE revoke skipped: no handshake session\n");
+			} else {
+				ret = sns_simple(cr, QSH_REVOKE,
+						 QSH_REVOKE_ACK, NULL, 0);
+				if (ret)
+					dev_warn(cr->dev,
+						 "SEE revoke failed (%d)\n",
+						 ret);
+			}
 		}
-		/* the AON camera powers the module; enable it on SEE */
-		sns_aon_power_on(cr);
 	}
 
 	ret = pinctrl_select_state(cr->pctl, cr->p_active);
@@ -1052,9 +1168,15 @@ static int release_locked(struct oplus_camres *cr)
 	geni_destroy(cr);
 
 	dev_info(cr->dev, "camera bus released to SEE\n");
-	if (!cr->sns_quiet)
+	if (!cr->sns_quiet && cr->hs_ok)
 		sns_release_notify(cr);
 	camres_uevent(cr, "SEE");
+	/*
+	 * After a SEE restart the AON subscribe (and with it the module
+	 * power) is gone; re-arm it now that SEE owns the bus again.
+	 */
+	if (cr->registered && !cr->aon_armed)
+		schedule_delayed_work(&cr->session_work, 0);
 	return 0;
 }
 
@@ -1141,10 +1263,12 @@ bool oplus_camres_ap_holds(void)
 EXPORT_SYMBOL_GPL(oplus_camres_ap_holds);
 
 /*
- * True once SEE has answered the camera handshake (which needs the ADSP
- * up *and* adsprpcd serving).  Consumers defer their probe while this
- * is false; when it turns true camres reprobes its unbound children
- * and emits a KOBJ_CHANGE uevent (CAMRES_READY=1).
+ * True once the session bring-up completed: SEE answered INIT (an ACK
+ * carrying only a config error still counts — the service is up) and
+ * the AON subscribe that powers the module was acked.  This needs the
+ * ADSP up *and* adsprpcd serving.  Consumers defer their probe while
+ * this is false; when it turns true camres reprobes its unbound
+ * children and emits a KOBJ_CHANGE uevent (CAMRES_READY=1).
  */
 bool oplus_camres_is_ready(void)
 {
