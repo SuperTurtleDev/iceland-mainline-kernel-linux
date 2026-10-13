@@ -41,6 +41,8 @@
 
 #include <linux/delay.h>
 #include <linux/capability.h>
+#include <linux/cleanup.h>
+#include <linux/completion.h>
 #include <linux/i2c.h>
 #include <linux/kstrtox.h>
 #include <linux/module.h>
@@ -54,6 +56,10 @@
 #include <linux/pinctrl/consumer.h>
 #include <linux/pm_runtime.h>
 #include <linux/qrtr.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/wait.h>
+#include <net/sock.h>
 #include <linux/uio.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -89,6 +95,7 @@
 #define GENI_TIMEOUT_MS		2000
 #define SUSPEND_TIMEOUT_MS	1000
 #define LOOKUP_RETRY_MS		3000
+#define LOOKUP_REPLAY_MS	300
 #define SESSION_RETRY_MS	1000
 
 #define CAMRES_ATTACH_NAME	"icelandmain"
@@ -213,6 +220,15 @@ struct oplus_camres {
 
 	/* resident SNS client */
 	struct socket *sock;
+	void (*saved_data_ready)(struct sock *sk);
+	struct work_struct rx_work;	/* drains the socket on data-ready */
+	wait_queue_head_t rx_wq;	/* discovery: sns_found changes */
+	struct mutex sns_lock;		/* one request/ack transaction at a time */
+	spinlock_t ack_lock;		/* the armed-ack state below */
+	struct completion ack_done;
+	u32 ack_expect;			/* msg id awaited, 0 = none */
+	u64 ack_uid_lo;
+	u64 ack_uid_hi;
 	struct sockaddr_qrtr sns_sq;
 	bool sns_found;
 	bool registered;	/* SNS client registered (ADSP up) */
@@ -296,8 +312,11 @@ struct camres_sns_body_release {
 
 /* ---- SNS transport ---- */
 
+static void camres_data_ready(struct sock *sk);
+
 static int sns_socket_open(struct oplus_camres *cr)
 {
+	struct sock *sk;
 	int ret;
 
 	if (cr->sock)
@@ -305,9 +324,37 @@ static int sns_socket_open(struct oplus_camres *cr)
 
 	ret = sock_create_kern(&init_net, AF_QIPCRTR, SOCK_DGRAM, 0,
 			       &cr->sock);
-	if (ret)
+	if (ret) {
 		dev_err(cr->dev, "qrtr socket: %d\n", ret);
-	return ret;
+		return ret;
+	}
+
+	/* event-driven receive, as net/qrtr/ns.c does for its socket */
+	sk = cr->sock->sk;
+	write_lock_bh(&sk->sk_callback_lock);
+	sk->sk_user_data = cr;
+	cr->saved_data_ready = sk->sk_data_ready;
+	sk->sk_data_ready = camres_data_ready;
+	write_unlock_bh(&sk->sk_callback_lock);
+	return 0;
+}
+
+static void sns_socket_close(struct oplus_camres *cr)
+{
+	struct sock *sk;
+
+	if (!cr->sock)
+		return;
+
+	sk = cr->sock->sk;
+	write_lock_bh(&sk->sk_callback_lock);
+	sk->sk_data_ready = cr->saved_data_ready;
+	sk->sk_user_data = NULL;
+	write_unlock_bh(&sk->sk_callback_lock);
+
+	cancel_work_sync(&cr->rx_work);
+	sock_release(cr->sock);
+	cr->sock = NULL;
 }
 
 static int sns_send(struct oplus_camres *cr, u64 uid_lo, u64 uid_hi,
@@ -434,48 +481,111 @@ static int sns_parse_ack(const u8 *buf, size_t len, u64 uid_lo, u64 uid_hi,
 	return 0;
 }
 
-/*
- * Block until the ACK indication for @expect arrives.  Control-plane
- * datagrams seen while waiting are fed to the discovery parser.
- */
-static int sns_wait_ack(struct oplus_camres *cr, u32 expect,
-			u64 uid_lo, u64 uid_hi)
+/* softirq context: just kick the drain work */
+static void camres_data_ready(struct sock *sk)
 {
-	u8 buf[CAMRES_SSC_MAX + 32];
-	unsigned long deadline = jiffies + msecs_to_jiffies(ACK_TIMEOUT_MS);
+	struct oplus_camres *cr;
+
+	read_lock_bh(&sk->sk_callback_lock);
+	cr = sk->sk_user_data;
+	if (cr)
+		schedule_work(&cr->rx_work);
+	read_unlock_bh(&sk->sk_callback_lock);
+}
+
+/* a data-plane datagram: complete the armed transaction if it matches */
+static void camres_rx_ack(struct oplus_camres *cr, const u8 *buf, size_t len)
+{
 	struct camres_sns_ack_tail tail;
 	int ret;
+
+	spin_lock(&cr->ack_lock);
+	if (!cr->ack_expect) {
+		ret = -ENOENT;
+		goto out;
+	}
+	ret = sns_parse_ack(buf, len, cr->ack_uid_lo, cr->ack_uid_hi,
+			    cr->ack_expect, &tail);
+	if (ret)
+		goto out;
+
+	cr->ack_error = tail.error;
+	cr->ack_state = tail.state;
+	dev_info(cr->dev, "sns ack 0x%x: error=%u state=%u\n",
+		 cr->ack_expect, tail.error, tail.state);
+	cr->ack_expect = 0;
+	complete(&cr->ack_done);
+out:
+	spin_unlock(&cr->ack_lock);
+	if (ret)
+		dev_dbg(cr->dev, "sns datagram dropped (reason %d)\n", ret);
+}
+
+/*
+ * Drain everything queued on the socket.  Control-plane datagrams go
+ * to the discovery parser, the rest to the ack matcher.  Runs whenever
+ * the socket signals data-ready, so nobody has to poll.
+ */
+static void rx_work_fn(struct work_struct *work)
+{
+	struct oplus_camres *cr = container_of(work, struct oplus_camres,
+					       rx_work);
+	u8 *buf __free(kfree) = kmalloc(CAMRES_SSC_MAX + 32, GFP_KERNEL);
+	int ret;
+
+	if (!buf)
+		return;
 
 	while (1) {
 		struct sockaddr_qrtr from = { };
 		struct msghdr m = { .msg_name = &from,
 				    .msg_namelen = sizeof(from) };
-		struct kvec iov = { buf, sizeof(buf) - 1 };
+		struct kvec iov = { buf, CAMRES_SSC_MAX + 31 };
 
-		ret = kernel_recvmsg(cr->sock, &m, &iov, 1,
-				     sizeof(buf) - 1, MSG_DONTWAIT);
-		if (ret > 0 && from.sq_port == QRTR_PORT_CTRL) {
+		ret = kernel_recvmsg(cr->sock, &m, &iov, 1, iov.iov_len,
+				     MSG_DONTWAIT);
+		if (ret <= 0)
+			break;
+
+		if (from.sq_port == QRTR_PORT_CTRL) {
 			camres_parse_ctrl(cr, buf, ret);
-			continue;
+			wake_up(&cr->rx_wq);
+		} else {
+			camres_rx_ack(cr, buf, ret);
 		}
-		if (ret > 0) {
-			ret = sns_parse_ack(buf, ret, uid_lo, uid_hi,
-					    expect, &tail);
-			if (ret == 0) {
-				cr->ack_error = tail.error;
-				cr->ack_state = tail.state;
-				dev_info(cr->dev,
-					 "sns ack 0x%x: error=%u state=%u\n",
-					 expect, tail.error, tail.state);
-				return 0;
-			}
-			dev_dbg(cr->dev, "sns datagram dropped (reason %d)\n",
-				ret);
-		}
-		if (time_after(jiffies, deadline))
-			return -ETIMEDOUT;
-		msleep(20);
 	}
+}
+
+/*
+ * One request/ack transaction: arm the matcher, send, wait.  Arming
+ * before the send closes the window where a fast ack could arrive
+ * before anyone expects it.
+ */
+static int sns_xfer(struct oplus_camres *cr, u64 uid_lo, u64 uid_hi,
+		    u32 msg_id, const u8 *msg, size_t msg_len, u32 expect)
+{
+	int ret;
+
+	mutex_lock(&cr->sns_lock);
+
+	spin_lock(&cr->ack_lock);
+	reinit_completion(&cr->ack_done);
+	cr->ack_expect = expect;
+	cr->ack_uid_lo = uid_lo;
+	cr->ack_uid_hi = uid_hi;
+	spin_unlock(&cr->ack_lock);
+
+	ret = sns_send(cr, uid_lo, uid_hi, msg_id, msg, msg_len);
+	if (!ret && !wait_for_completion_timeout(&cr->ack_done,
+					msecs_to_jiffies(ACK_TIMEOUT_MS)))
+		ret = -ETIMEDOUT;
+
+	spin_lock(&cr->ack_lock);
+	cr->ack_expect = 0;
+	spin_unlock(&cr->ack_lock);
+
+	mutex_unlock(&cr->sns_lock);
+	return ret;
 }
 
 /* ---- resident client: discovery + registration ---- */
@@ -495,8 +605,6 @@ static void lookup_work_fn(struct work_struct *work)
 	struct sockaddr_qrtr to = { };
 	struct msghdr m = { .msg_name = &to, .msg_namelen = sizeof(to) };
 	struct kvec iov = { &pkt, sizeof(pkt) };
-	u8 buf[64];
-	unsigned long deadline = jiffies + msecs_to_jiffies(300);
 	int ret;
 
 	if (cr->sns_found)
@@ -516,25 +624,9 @@ static void lookup_work_fn(struct work_struct *work)
 	if (ret < 0)
 		goto retry;
 
-	/* drain the replay looking for the SNS service */
-	while (!cr->sns_found) {
-		struct sockaddr_qrtr from = { };
-		struct msghdr rm = { .msg_name = &from,
-				     .msg_namelen = sizeof(from) };
-		struct kvec riov = { buf, sizeof(buf) - 1 };
-
-		ret = kernel_recvmsg(cr->sock, &rm, &riov, 1,
-				     sizeof(buf) - 1, MSG_DONTWAIT);
-		if (ret > 0 && from.sq_port == QRTR_PORT_CTRL)
-			camres_parse_ctrl(cr, buf, ret);
-		if (ret <= 0) {
-			if (time_after(jiffies, deadline))
-				break;
-			msleep(10);
-		}
-	}
-
-	if (!cr->sns_found)
+	/* rx_work parses the replay; wait for it to spot the SNS service */
+	if (!wait_event_timeout(cr->rx_wq, cr->sns_found,
+				msecs_to_jiffies(LOOKUP_REPLAY_MS)))
 		goto retry;
 
 	/* register the resident client with the SUID registry */
@@ -542,12 +634,9 @@ static void lookup_work_fn(struct work_struct *work)
 		u8 body[32];
 		size_t len = sns_body_lookup(body);
 
-		ret = sns_send(cr, SNS_SUID_MAGIC, SNS_SUID_MAGIC,
-			       SNS_MSG_SUID_LOOKUP, body, len);
-		if (ret)
-			goto retry;
-		ret = sns_wait_ack(cr, SNS_MSG_SUID_RESULT,
-				   SNS_SUID_MAGIC, SNS_SUID_MAGIC);
+		ret = sns_xfer(cr, SNS_SUID_MAGIC, SNS_SUID_MAGIC,
+			       SNS_MSG_SUID_LOOKUP, body, len,
+			       SNS_MSG_SUID_RESULT);
 		if (ret) {
 			dev_info(cr->dev, "sns registration: no ack\n");
 			goto retry;
@@ -618,11 +707,8 @@ static int sns_attach(struct oplus_camres *cr)
 		return -ENOTCONN;
 
 	len = sns_body_init(body, cr->attach_name, cr->attach_slot);
-	ret = sns_send(cr, cr->suid_lo, cr->suid_hi, QSH_INIT, body, len);
-	if (ret)
-		return ret;
-
-	ret = sns_wait_ack(cr, QSH_INIT_ACK, cr->suid_lo, cr->suid_hi);
+	ret = sns_xfer(cr, cr->suid_lo, cr->suid_hi, QSH_INIT, body, len,
+		       QSH_INIT_ACK);
 	if (ret)
 		return ret;
 	if (cr->ack_error) {
@@ -642,11 +728,7 @@ static int sns_simple(struct oplus_camres *cr, u32 msg, u32 ack,
 	if (!cr->registered)
 		return -ENOTCONN;
 
-	ret = sns_send(cr, cr->suid_lo, cr->suid_hi, msg, body, len);
-	if (ret)
-		return ret;
-
-	ret = sns_wait_ack(cr, ack, cr->suid_lo, cr->suid_hi);
+	ret = sns_xfer(cr, cr->suid_lo, cr->suid_hi, msg, body, len, ack);
 	if (ret)
 		return ret;
 	if (cr->ack_error) {
@@ -1196,6 +1278,11 @@ static int oplus_camres_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&cr->release_work, release_work_fn);
 	INIT_DELAYED_WORK(&cr->lookup_work, lookup_work_fn);
 	INIT_DELAYED_WORK(&cr->session_work, session_work_fn);
+	INIT_WORK(&cr->rx_work, rx_work_fn);
+	init_waitqueue_head(&cr->rx_wq);
+	mutex_init(&cr->sns_lock);
+	spin_lock_init(&cr->ack_lock);
+	init_completion(&cr->ack_done);
 	platform_set_drvdata(pdev, cr);
 
 	cr->geni_np = of_parse_phandle(dev->of_node, "i2c-bus", 0);
@@ -1285,8 +1372,7 @@ static void oplus_camres_remove(struct platform_device *pdev)
 	mutex_unlock(&cr->lock);
 
 	i2c_del_adapter(&cr->adapter);
-	if (cr->sock)
-		sock_release(cr->sock);
+	sns_socket_close(cr);
 	of_node_put(cr->geni_np);
 }
 
