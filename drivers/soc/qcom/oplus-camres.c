@@ -40,6 +40,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/capability.h>
 #include <linux/i2c.h>
 #include <linux/kstrtox.h>
 #include <linux/module.h>
@@ -1107,6 +1108,10 @@ static ssize_t force_start_i2c_store(struct device *dev,
 	bool val;
 	int ret;
 
+	/* taking the bus from the SEE is a privileged operation */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
 	ret = kstrtobool(buf, &val);
 	if (ret)
 		return ret;
@@ -1116,7 +1121,8 @@ static ssize_t force_start_i2c_store(struct device *dev,
 	mutex_unlock(&cr->lock);
 	return ret ? ret : count;
 }
-static DEVICE_ATTR_RW(force_start_i2c);
+static struct device_attribute dev_attr_force_start_i2c =
+	__ATTR(force_start_i2c, 0600, force_start_i2c_show, force_start_i2c_store);
 
 static ssize_t force_start_i2c_direct_show(struct device *dev,
 					   struct device_attribute *attr,
@@ -1135,6 +1141,10 @@ static ssize_t force_start_i2c_direct_store(struct device *dev,
 	bool val;
 	int ret;
 
+	/* taking the bus from the SEE is a privileged operation */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
 	ret = kstrtobool(buf, &val);
 	if (ret)
 		return ret;
@@ -1144,7 +1154,9 @@ static ssize_t force_start_i2c_direct_store(struct device *dev,
 	mutex_unlock(&cr->lock);
 	return ret ? ret : count;
 }
-static DEVICE_ATTR_RW(force_start_i2c_direct);
+static struct device_attribute dev_attr_force_start_i2c_direct =
+	__ATTR(force_start_i2c_direct, 0600,
+	       force_start_i2c_direct_show, force_start_i2c_direct_store);
 
 static ssize_t ap_holds_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
