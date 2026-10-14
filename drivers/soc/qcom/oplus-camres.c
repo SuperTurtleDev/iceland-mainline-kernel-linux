@@ -122,6 +122,7 @@
 #define LOOKUP_RETRY_MS		3000
 #define LOOKUP_REPLAY_MS	300
 #define AON_RETRY_MS		1000
+#define AON_BOOT_TRIES		10
 #define RELEASE_IDLE_MS		2000
 
 #define CAMRES_ATTACH_NAME	"icelandmain"
@@ -315,6 +316,8 @@ struct oplus_camres {
 	bool sns_found;
 	u8 ack_error;		/* from the last ACK */
 	u8 ack_state;
+	bool boot_done;		/* adapter registered, children visible */
+	int aon_tries;
 	bool registered;	/* SNS client registered (ADSP up) */
 	bool aon_armed;		/* AON subscribe acked — REVOKE precondition */
 	u16 txn;
@@ -885,38 +888,69 @@ static void sns_aon_power_off(struct oplus_camres *cr)
 }
 
 /*
- * Best-effort AON subscribe, retried in the background: the camera
- * module is powered through it, and once it stands REVOKE is
- * answerable.  Runs whenever the SNS service is (re)discovered or
- * after a handback that needs re-arming; not a precondition for the
- * bus itself — UNCONFIGURED works without it.
+ * AON subscribe (camera module power), retried in the background.
+ * Runs at exactly three points: the boot chain (before the bus is
+ * ever taken), a SEE restart (deferred until active users hand the
+ * bus back), and right after a userspace INIT cycle.  The subscribe
+ * needs the bus free — the SEE rejects it while the camera is
+ * "acquired" — so while users hold the bus this just retries cheaply
+ * until they are done.
+ *
+ * During boot the bus is not registered yet: children cannot vote,
+ * so the retry window is naturally conflict-free, and the adapter is
+ * only added once the module power question is settled (or given up
+ * on, when the SEE never answers at all).
  */
+static void camres_boot_done(struct oplus_camres *cr);
+
 static void aon_work_fn(struct work_struct *work)
 {
 	struct oplus_camres *cr = container_of(to_delayed_work(work),
 					       struct oplus_camres, aon_work);
+	bool boot_phase = !cr->boot_done;
 	int ret;
 
 	if (!cr->registered || cr->aon_armed)
 		return;
 
-	mutex_lock(&cr->lock);
 	if (cr->state == CAMRES_CONFIGURING) {
 		/* DEINIT in flight: resubscribe happens at INIT */
-		mutex_unlock(&cr->lock);
+		if (boot_phase)
+			schedule_delayed_work(&cr->aon_work,
+					      msecs_to_jiffies(AON_RETRY_MS));
 		return;
 	}
-	mutex_unlock(&cr->lock);
+
+	if (cr->ap_active) {
+		/* SEE would reject the subscribe while the camera is
+		 * acquired; retry when the bus returns to the SEE */
+		schedule_delayed_work(&cr->aon_work,
+				      msecs_to_jiffies(AON_RETRY_MS));
+		return;
+	}
 
 	ret = sns_aon_power_on(cr);
 	if (ret) {
 		dev_info(cr->dev, "SEE AON subscribe pending (%d)\n", ret);
+		if (boot_phase && ++cr->aon_tries >= AON_BOOT_TRIES) {
+			/* the SEE never answers (ADSP down, no userspace
+			 * serving): settle the boot question without it —
+			 * the module stays unpowered, which is the best
+			 * the hardware allows in this situation anyway */
+			dev_warn(cr->dev,
+				 "SEE silent: bringing the bus up unpowered\n");
+			camres_boot_done(cr);
+			return;
+		}
 		schedule_delayed_work(&cr->aon_work,
 				      msecs_to_jiffies(AON_RETRY_MS));
 		return;
 	}
 	cr->aon_armed = true;
 	dev_info(cr->dev, "SEE AON subscribed (camera module powered)\n");
+
+	if (boot_phase)
+		camres_boot_done(cr);
 }
 
 /* ---- dynamic geni_i2c instantiation ---- */
@@ -1180,6 +1214,9 @@ static const struct i2c_algorithm camres_i2c_algo = {
 static int camres_acquire_vote(struct oplus_camres *cr)
 {
 	int ret;
+
+	if (!READ_ONCE(cr->boot_done))
+		return -EAGAIN;
 
 	mutex_lock(&cr->lock);
 	for (;;) {
@@ -1487,8 +1524,20 @@ static long camres_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		}
 		mutex_unlock(&cr->lock);
 
-		/* re-arm the AON subscribe either way */
-		schedule_delayed_work(&cr->aon_work, 0);
+		/*
+		 * Re-subscribe AON *before* waking the queued acquirers:
+		 * the subscribe needs the bus free, and once it stands the
+		 * REVOKE precondition of this session's first takeover is
+		 * met.  One synchronous attempt — a failure degrades to a
+		 * takeover without REVOKE, logged.
+		 */
+		if (!cr->aon_armed && !sns_aon_power_on(cr)) {
+			cr->aon_armed = true;
+			dev_info(cr->dev, "SEE AON resubscribed\n");
+		} else if (!cr->aon_armed) {
+			dev_warn(cr->dev, "SEE AON resubscribe failed\n");
+			schedule_delayed_work(&cr->aon_work, 0);
+		}
 		wake_up_interruptible_all(&cr->state_wq);
 		return 0;
 	}
@@ -1612,11 +1661,82 @@ static const struct dev_pm_ops camres_pm_ops = {
 
 /* ---- platform driver ---- */
 
+/*
+ * Boot settlement: the module-power question is resolved (AON armed)
+ * or given up on (SEE silent), so the bus is taken for good and the
+ * adapter — with its children — becomes visible.  Children probe
+ * against a held bus with the module already powered.
+ */
+static void camres_boot_done(struct oplus_camres *cr)
+{
+	int ret;
+
+	if (cr->boot_done)
+		return;
+
+	cr->state = CAMRES_UNCONFIGURED;
+	mutex_lock(&cr->lock);
+	ret = takeover_locked(cr, false);
+	mutex_unlock(&cr->lock);
+	if (ret) {
+		dev_err(cr->dev, "boot takeover failed (%d)\n", ret);
+		schedule_delayed_work(&cr->aon_work,
+				      msecs_to_jiffies(AON_RETRY_MS));
+		return;
+	}
+
+	ret = bus_register_notifier(&i2c_bus_type, &cr->nb);
+	if (ret)
+		goto err_release;
+
+	ret = i2c_add_adapter(&cr->adapter);
+	if (ret)
+		goto err_notifier;
+
+	cr->misc.minor = MISC_DYNAMIC_MINOR;
+	cr->misc.name = "camres";
+	cr->misc.fops = &camres_fops;
+	cr->misc.parent = cr->dev;
+	ret = misc_register(&cr->misc);
+	if (ret)
+		goto err_adapter;
+
+	/*
+	 * Runtime PM: autosuspend hands an idle CONFIGURED bus to the
+	 * SEE; in the other states the suspend callback is a no-op, so
+	 * no reference is pinned here — UNCONFIGURED and ERR keep the
+	 * bus through ->ap_active and the state gates alone, and the
+	 * DEINIT wait can observe "suspended" uniformly.
+	 */
+	pm_runtime_set_active(cr->dev);
+	pm_runtime_enable(cr->dev);
+	pm_runtime_set_autosuspend_delay(cr->dev, RELEASE_IDLE_MS);
+	pm_runtime_use_autosuspend(cr->dev);
+
+	cr->boot_done = true;
+	g_camres = cr;
+	kobject_uevent_env(&cr->dev->kobj, KOBJ_CHANGE,
+			   (char *[]){ "CAMRES_READY=1", NULL });
+	dev_info(cr->dev, "camera bus ready, held to AP (bus %d)\n",
+		 i2c_adapter_id(&cr->adapter));
+	return;
+
+err_adapter:
+	i2c_del_adapter(&cr->adapter);
+err_notifier:
+	bus_unregister_notifier(&i2c_bus_type, &cr->nb);
+err_release:
+	mutex_lock(&cr->lock);
+	if (cr->ap_active)
+		release_locked(cr);
+	mutex_unlock(&cr->lock);
+	dev_err(cr->dev, "boot bring-up failed (%d)\n", ret);
+}
+
 static int oplus_camres_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct oplus_camres *cr;
-	int ret;
 
 	cr = devm_kzalloc(dev, sizeof(*cr), GFP_KERNEL);
 	if (!cr)
@@ -1674,66 +1794,18 @@ static int oplus_camres_probe(struct platform_device *pdev)
 		sizeof(cr->adapter.name));
 	i2c_set_adapdata(&cr->adapter, cr);
 
-	/*
-	 * Boot state: UNCONFIGURED — the AP takes the bus right away so
-	 * the camera works with zero userspace.  Children probing against
-	 * it are covered by the BIND_DRIVER votes from the notifier
-	 * registered below (before any child can appear).
-	 */
-	cr->state = CAMRES_UNCONFIGURED;
-	mutex_lock(&cr->lock);
-	ret = takeover_locked(cr, false);
-	mutex_unlock(&cr->lock);
-	if (ret)
-		return dev_err_probe(dev, ret, "boot takeover failed\n");
-
 	cr->nb.notifier_call = camres_bus_notify;
-	ret = bus_register_notifier(&i2c_bus_type, &cr->nb);
-	if (ret)
-		goto err_release;
-
-	ret = i2c_add_adapter(&cr->adapter);
-	if (ret)
-		goto err_notifier;
-
-	cr->misc.minor = MISC_DYNAMIC_MINOR;
-	cr->misc.name = "camres";
-	cr->misc.fops = &camres_fops;
-	cr->misc.parent = dev;
-	ret = misc_register(&cr->misc);
-	if (ret)
-		goto err_adapter;
 
 	/*
-	 * Runtime PM: autosuspend hands an idle CONFIGURED bus to the
-	 * SEE; in the other states the suspend callback is a no-op, so
-	 * no reference is pinned here — UNCONFIGURED and ERR keep the
-	 * bus through ->ap_active and the state gates alone, and the
-	 * DEINIT wait can observe "suspended" uniformly.
+	 * Boot: discover the SNS service, subscribe AON (which needs the
+	 * bus free), and only then take the bus and expose the adapter —
+	 * camres_boot_done() from aon_work_fn.  Nothing here blocks
+	 * probe; the camera subsystem appears asynchronously.
 	 */
-	pm_runtime_set_active(dev);
-	pm_runtime_enable(dev);
-	pm_runtime_set_autosuspend_delay(dev, RELEASE_IDLE_MS);
-	pm_runtime_use_autosuspend(dev);
-
-	/* resident SNS client: discover + AON subscribe in the background */
 	schedule_delayed_work(&cr->lookup_work, 0);
 
-	g_camres = cr;
-	dev_info(dev, "camera bus ready, held to AP (bus %d)\n",
-		 i2c_adapter_id(&cr->adapter));
+	dev_info(dev, "camera bus manager starting (SEE boot chain)\n");
 	return 0;
-
-err_adapter:
-	i2c_del_adapter(&cr->adapter);
-err_notifier:
-	bus_unregister_notifier(&i2c_bus_type, &cr->nb);
-err_release:
-	mutex_lock(&cr->lock);
-	if (cr->ap_active)
-		release_locked(cr);
-	mutex_unlock(&cr->lock);
-	return ret;
 }
 
 static void oplus_camres_remove(struct platform_device *pdev)
@@ -1745,6 +1817,13 @@ static void oplus_camres_remove(struct platform_device *pdev)
 	cancel_delayed_work_sync(&cr->release_work);
 	cancel_delayed_work_sync(&cr->lookup_work);
 	cancel_delayed_work_sync(&cr->aon_work);
+
+	if (!cr->boot_done) {
+		/* boot chain never settled: nothing was registered */
+		sns_socket_close(cr);
+		of_node_put(cr->geni_np);
+		return;
+	}
 
 	pm_runtime_disable(cr->dev);
 
