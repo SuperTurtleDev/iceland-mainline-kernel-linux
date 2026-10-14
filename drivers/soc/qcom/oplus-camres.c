@@ -123,6 +123,7 @@
 #define LOOKUP_REPLAY_MS	300
 #define AON_RETRY_MS		1000
 #define AON_BOOT_TRIES		10
+#define LOOKUP_BOOT_TRIES	30	/* ~90s at LOOKUP_RETRY_MS */
 #define RELEASE_IDLE_MS		2000
 
 #define CAMRES_ATTACH_NAME	"icelandmain"
@@ -318,6 +319,7 @@ struct oplus_camres {
 	u8 ack_state;
 	bool boot_done;		/* adapter registered, children visible */
 	int aon_tries;
+	int lookup_tries;
 	bool registered;	/* SNS client registered (ADSP up) */
 	bool aon_armed;		/* AON subscribe acked — REVOKE precondition */
 	u16 txn;
@@ -685,6 +687,8 @@ static int sns_xfer(struct oplus_camres *cr, u64 uid_lo, u64 uid_hi,
  * replays every registered server and announces later ones.  We select
  * the SNS service ourselves.
  */
+static void camres_boot_done(struct oplus_camres *cr);
+
 static void lookup_work_fn(struct work_struct *work)
 {
 	struct oplus_camres *cr = container_of(to_delayed_work(work),
@@ -737,6 +741,18 @@ static void lookup_work_fn(struct work_struct *work)
 	return;
 
 retry:
+	/*
+	 * A SEE that never appears (ADSP down, firmware absent) must not
+	 * keep the whole camera subsystem unregistered forever: after a
+	 * generous window settle the boot without it — the bus comes up
+	 * unpowered, which is all this hardware can do in that state.
+	 */
+	if (!cr->boot_done && ++cr->lookup_tries >= LOOKUP_BOOT_TRIES) {
+		dev_warn(cr->dev,
+			 "SEE service never appeared: bringing the bus up unpowered\n");
+		camres_boot_done(cr);
+		return;
+	}
 	schedule_delayed_work(&cr->lookup_work,
 			      msecs_to_jiffies(LOOKUP_RETRY_MS));
 }
@@ -901,8 +917,6 @@ static void sns_aon_power_off(struct oplus_camres *cr)
  * only added once the module power question is settled (or given up
  * on, when the SEE never answers at all).
  */
-static void camres_boot_done(struct oplus_camres *cr);
-
 static void aon_work_fn(struct work_struct *work)
 {
 	struct oplus_camres *cr = container_of(to_delayed_work(work),
@@ -910,8 +924,19 @@ static void aon_work_fn(struct work_struct *work)
 	bool boot_phase = !cr->boot_done;
 	int ret;
 
-	if (!cr->registered || cr->aon_armed)
+	if (!cr->registered)
 		return;
+
+	/*
+	 * Already armed but the boot settlement has not happened (a
+	 * previous camres_boot_done attempt failed) — finish the boot
+	 * instead of dropping the retry on the floor.
+	 */
+	if (cr->aon_armed) {
+		if (!cr->boot_done)
+			camres_boot_done(cr);
+		return;
+	}
 
 	if (cr->state == CAMRES_CONFIGURING) {
 		/* DEINIT in flight: resubscribe happens at INIT */
@@ -1339,8 +1364,14 @@ static int camres_bus_notify(struct notifier_block *nb, unsigned long action,
 	case BUS_NOTIFY_BIND_DRIVER:
 		child = camres_child_find(cr, dev);
 		if (child && !child->probe_vote) {
-			child->probe_vote = true;
-			camres_acquire_vote(cr);
+			/*
+			 * Vote first, book only on success: a failed
+			 * acquire (ERR, interrupted wait) must not be
+			 * released at the BOUND boundary — that would
+			 * steal another user's vote.
+			 */
+			if (!camres_acquire_vote(cr))
+				child->probe_vote = true;
 		}
 		break;
 	case BUS_NOTIFY_BOUND_DRIVER:
@@ -1574,30 +1605,38 @@ static ssize_t ap_hold_store(struct device *dev,
 	if (ret)
 		return ret;
 
+	/*
+	 * The manual vote is serialized end-to-end: a write-1 whose
+	 * acquire is parked in a CONFIGURING wait must not race a
+	 * write-0 that would release a vote never taken (or strand one
+	 * taken after the clear).
+	 */
 	mutex_lock(&cr->lock);
 	if (val) {
-		if (!cr->manual_ap) {
-			cr->manual_ap = true;
-			mutex_unlock(&cr->lock);
-			ret = camres_acquire_vote(cr);
-			if (ret)
-				cr->manual_ap = false;
-			else
-				return count;
-			return ret ?: count;
-		}
+		if (cr->manual_ap)
+			goto out;
+		mutex_unlock(&cr->lock);
+
+		ret = camres_acquire_vote(cr);
+		if (ret)
+			return ret;
+
+		mutex_lock(&cr->lock);
+		cr->manual_ap = true;
 	} else {
 		if (READ_ONCE(cr->state) == CAMRES_UNCONFIGURED) {
 			mutex_unlock(&cr->lock);
 			return -EOPNOTSUPP;
 		}
-		if (cr->manual_ap) {
-			cr->manual_ap = false;
-			mutex_unlock(&cr->lock);
-			camres_release_vote(cr);
-			return count;
-		}
+		if (!cr->manual_ap)
+			goto out;
+		cr->manual_ap = false;
+		mutex_unlock(&cr->lock);
+
+		camres_release_vote(cr);
+		return count;
 	}
+out:
 	mutex_unlock(&cr->lock);
 	return count;
 }
@@ -1615,24 +1654,28 @@ ATTRIBUTE_GROUPS(camres);
 static int camres_runtime_resume(struct device *dev)
 {
 	struct oplus_camres *cr = dev_get_drvdata(dev);
+	enum camres_state state = READ_ONCE(cr->state);
 	int ret;
 
-	mutex_lock(&cr->lock);
-	while (READ_ONCE(cr->state) == CAMRES_CONFIGURING) {
-		mutex_unlock(&cr->lock);
-		/*
-		 * Uninterruptible: runtime PM has nowhere to propagate a
-		 * signal; the wait ends with userspace INIT or owner
-		 * death (which wakes and fails us through ERR).
-		 */
-		wait_event(cr->state_wq,
-			   READ_ONCE(cr->state) != CAMRES_CONFIGURING);
-		mutex_lock(&cr->lock);
-	}
-	if (READ_ONCE(cr->state) == CAMRES_ERR) {
-		mutex_unlock(&cr->lock);
+	/*
+	 * The runtime PM core increments the usage count of this device
+	 * BEFORE calling here (it must, to keep the supplier active
+	 * across the consumer's resume).  Queueing inside CONFIGURING
+	 * would therefore hold a usage reference while parked — and a
+	 * DEINIT waiting for pm_runtime_suspended() could never
+	 * complete, deadlocking against the userspace INIT that only
+	 * the DEINIT caller can issue.  So the runtime path fails fast
+	 * instead of queueing: the child's resume errors out, its
+	 * driver retries, and the ioctl/kernel-API acquire paths (which
+	 * queue first and count only afterwards) carry the queueing
+	 * semantics.
+	 */
+	if (state == CAMRES_CONFIGURING)
+		return -EAGAIN;
+	if (state == CAMRES_ERR)
 		return -EIO;
-	}
+
+	mutex_lock(&cr->lock);
 	ret = takeover_locked(cr, READ_ONCE(cr->state) == CAMRES_CONFIGURED);
 	mutex_unlock(&cr->lock);
 	return ret;
