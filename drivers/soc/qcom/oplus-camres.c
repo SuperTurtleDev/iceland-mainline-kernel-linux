@@ -12,49 +12,60 @@
  *
  * Ownership:
  *
- *   - SEE (default): nothing in DT occupies gpio4/5, i2c9 stays
- *     disabled, no geni device exists.  Transfers return -EBUSY.
+ *   - Boot (UNCONFIGURED): the AP takes the bus right away and holds
+ *     it — the camera works with zero userspace.  The AON subscribe
+ *     that powers the camera module is run best-effort in the
+ *     background.
  *
- *   - AP: a resident SNS client negotiates with SEE, then the pins are
- *     muxed to qup2_se1 and the geni device is instantiated:
+ *   - Userspace that wants proper arbitration opens /dev/camres and
+ *     choreographs the one protocol step that is genuinely its
+ *     business (the INIT handshake, which carries project camera
+ *     parameters):
  *
- *       registration (once, at service discovery):
- *           SUID lookup (msg 512, magic uid) -> 768
- *       session bring-up (retried until SEE answers; the AON subscribe
- *           powers the camera module — once, and kept standing):
- *           INIT 0x240 {name, 0, slot}   -> ACK 0x340 (error==0)
- *           RELEASE 0x241 {0}            -> ACK 0x341
- *           AON subscribe 516 + 513{cfg} -> camera_oplus_aon, ACK 0x20D
- *       takeover:  REVOKE 0x243 {}        -> ACK 0x343
- *                  [only while the AON subscribe stands: SEE does not
- *                   answer REVOKE, and AON commands die after it]
- *       release:   RELEASE 0x241 {0}      -> ACK 0x341
+ *         ioctl(DEINIT)  — blocks until every AP user is done, then
+ *                          unsubscribes AON; this fd becomes the owner
+ *         ... INIT handshake with SEE, from userspace ...
+ *         ioctl(INIT, ack_rc)
+ *             ack == 0   — CONFIGURED: per-use REVOKE/RELEASE
+ *                          arbitration via runtime PM
+ *             ack != 0   — back to UNCONFIGURED (vendor tolerance)
  *
- *     When INIT is ACKed with an error instead (module .pb missing)
- *     there is no session to arbitrate: the AON subscribe still runs
- *     (it powers the module), but the bus is taken once and held to
- *     the AP for good — acquire/release become no-ops until SEE
- *     restarts and the classification is re-made.
+ *     If the owner fd dies before INIT the bus enters ERR: acquires
+ *     fail until a fresh DEINIT/INIT cycle recovers it.  The kernel
+ *     never assumes anything about userspace liveness.
  *
- *     The sequence is ACK-driven: each request blocks until its ACK
- *     indication arrives (or times out); there are no sleeps.
+ *   - AP users never call into this driver: children hanging below
+ *     the adapter get a runtime-PM device link (supplier ordering),
+ *     and probe-time I2C — which bypasses runtime PM, as i2c sensor
+ *     drivers power on directly in probe — is covered by votes taken
+ *     at the exact bus-notifier boundaries BIND_DRIVER (probe is
+ *     about to run) and dropped at BOUND_DRIVER / BIND_FAILED.  A
+ *     child with no driver in the system never takes a vote, so the
+ *     bus is free for the SEE whenever the AP has nothing to do.
+ *
+ *     The public acquire/release API stays exported for drivers with
+ *     exotic probe strategies of their own.
  *
  * All SNS/QRTR/QMI wire layouts are fixed on this firmware and are
  * described by packed structs that are validated strictly — a datagram
  * that does not match is dropped with a reason and hex logged.
  *
  * sysfs:
- *   force_start_i2c        — kernel negotiates with SEE, then takes
- *                            the bus.  Write 0 to drop the hold.
- *   ap_holds               — read current ownership (1 = AP)
+ *   ap_hold (0600, DAC only) — manual ownership vote; write 1 to hold,
+ *                              0 to drop the manual vote (the bus then
+ *                              returns to the SEE once idle, unless
+ *                              UNCONFIGURED, where it is not
+ *                              supported)
  */
 
 #include <linux/delay.h>
-#include <linux/capability.h>
 #include <linux/cleanup.h>
 #include <linux/completion.h>
+#include <linux/device.h>
+#include <linux/fs.h>
 #include <linux/i2c.h>
 #include <linux/kstrtox.h>
+#include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/net.h>
@@ -70,10 +81,12 @@
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <net/sock.h>
+#include <linux/uaccess.h>
 #include <linux/uio.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <linux/oplus-camres.h>
+#include <uapi/linux/oplus-camres.h>
 
 /* ---- protocol constants (validated against libqmi/libqrtr + SEE) ---- */
 
@@ -94,11 +107,10 @@
 #define SNS_MSG_SENSOR_INFO	516
 #define SNS_MSG_SENSOR_CONFIG	513
 #define SNS_MSG_SENSOR_CONFIG_ACK 0x20D
+#define SNS_MSG_SENSOR_DISABLE	10
 #define SNS_AON_UID_LO		0xf8447cc60209c100ULL
 #define SNS_AON_UID_HI		0x3e9145ace8717480ULL
 
-#define QSH_INIT		0x240	/* attach {name, retry, slot, otp} */
-#define QSH_INIT_ACK		0x340
 #define QSH_RELEASE		0x241	/* hand back to SEE {power} */
 #define QSH_RELEASE_ACK		0x341
 #define QSH_REVOKE		0x243	/* take from SEE {} */
@@ -109,7 +121,8 @@
 #define SUSPEND_TIMEOUT_MS	1000
 #define LOOKUP_RETRY_MS		3000
 #define LOOKUP_REPLAY_MS	300
-#define SESSION_RETRY_MS	1000
+#define AON_RETRY_MS		1000
+#define RELEASE_IDLE_MS		2000
 
 #define CAMRES_ATTACH_NAME	"icelandmain"
 #define CAMRES_ATTACH_SLOT	0
@@ -226,13 +239,50 @@ struct camres_sns_revoke_tail {
 
 /* ---- driver state ---- */
 
+/*
+ * Bus lifecycle.  The kernel never binds itself to a userspace
+ * process: state transitions are driven by file objects and ioctls.
+ *
+ *   UNCONFIGURED  boot state: AP holds the bus, camera works with no
+ *                 userspace; AON subscribed best-effort
+ *   CONFIGURING   a DEINIT is (or was) in flight: acquires queue up
+ *   CONFIGURED    INIT succeeded: per-use REVOKE/RELEASE arbitration
+ *   ERR           the DEINIT owner died before INIT: acquires fail
+ *                 until a fresh DEINIT/INIT cycle recovers the bus
+ */
+enum camres_state {
+	CAMRES_UNCONFIGURED,
+	CAMRES_CONFIGURING,
+	CAMRES_CONFIGURED,
+	CAMRES_ERR,
+};
+
+/* per-fd state of the misc device */
+struct camres_file {
+	struct oplus_camres *cr;
+	bool vote;		/* this fd holds an ACQUIRE vote */
+	bool owner;		/* this fd is the deinit owner */
+};
+
+/* per-child probe/link tracking */
+struct camres_child {
+	struct list_head node;
+	struct device *dev;
+	struct device_link *link;
+	bool probe_vote;	/* vote held across an ongoing probe */
+};
+
 struct oplus_camres {
 	struct device *dev;
 
 	struct mutex lock;
-	atomic_t consumers;
-	bool force;		/* sysfs hold active */
+	atomic_t consumers;	/* runtime/ACQUIRE/probe/manual votes */
+	bool manual_ap;		/* sysfs manual vote active */
+	enum camres_state state;
+	struct camres_file *owner;	/* CONFIGURING deinit owner */
+	bool deinit_done;	/* CONFIGURING: AON unsubscribed, wait done */
 	bool ap_active;		/* pins muxed + geni instantiated */
+	wait_queue_head_t state_wq;	/* CONFIGURING waiters (acquires) */
 
 	struct pinctrl *pctl;
 	struct pinctrl_state *p_active;
@@ -245,6 +295,10 @@ struct oplus_camres {
 
 	struct i2c_adapter adapter;	/* the oplus,camres bus itself */
 	struct delayed_work release_work;
+	struct notifier_block nb;	/* i2c bus notifier (children) */
+	struct list_head children;	/* camres_child list */
+
+	struct miscdevice misc;
 
 	/* resident SNS client */
 	struct socket *sock;
@@ -259,34 +313,25 @@ struct oplus_camres {
 	u64 ack_uid_hi;
 	struct sockaddr_qrtr sns_sq;
 	bool sns_found;
+	u8 ack_error;		/* from the last ACK */
+	u8 ack_state;
 	bool registered;	/* SNS client registered (ADSP up) */
-	bool hs_ready;		/* INIT answered once (bring-up step 1) */
-	bool hs_ok;		/* handshake session valid (INIT error==0) */
 	bool aon_armed;		/* AON subscribe acked — REVOKE precondition */
-	bool session_ready;	/* SEE camera session up (module powered) */
 	u16 txn;
 	u64 suid_hi;
 	u64 suid_lo;
-	char attach_name[24];
-	u32 attach_slot;
-	u8 ack_error;		/* from the last ACK */
-	u8 ack_state;
 	struct delayed_work lookup_work;
-	struct delayed_work session_work;
+	struct delayed_work aon_work;
 };
 
 static struct oplus_camres *g_camres;
 
-/* experiment knobs (defaults come from DT) */
+/* experiment knobs */
 static bool revoke = true;
 module_param(revoke, bool, 0644);
 static u64 suid_hi, suid_lo;
 module_param(suid_hi, ullong, 0444);
 module_param(suid_lo, ullong, 0444);
-static char *attach_name;
-module_param(attach_name, charp, 0444);
-static int attach_slot = -1;
-module_param(attach_slot, int, 0444);
 
 /* ---- protobuf emitters (only for the variable-length name field) ---- */
 
@@ -310,7 +355,6 @@ static size_t pb_put_varint(u8 *b, size_t pos, unsigned int field, u64 val)
 /*
  * Message bodies:
  *   SUID lookup: {1: "camera_handshake", 2: 0, 3: 1}
- *   INIT:        {1: name, 2: 0, 3: slot, 4: ""}
  *   RELEASE:     {1: 0}
  *   REVOKE:      {} (empty)
  */
@@ -321,17 +365,6 @@ static size_t sns_body_lookup(u8 *b)
 	pos = pb_put_bytes(b, pos, 1, "camera_handshake", 16);
 	pos = pb_put_varint(b, pos, 2, 0);
 	pos = pb_put_varint(b, pos, 3, 1);
-	return pos;
-}
-
-static size_t sns_body_init(u8 *b, const char *name, u32 slot)
-{
-	size_t pos = 0;
-
-	pos = pb_put_bytes(b, pos, 1, name, strlen(name));
-	pos = pb_put_varint(b, pos, 2, 0);
-	pos = pb_put_varint(b, pos, 3, slot);
-	pos = pb_put_bytes(b, pos, 4, NULL, 0);
 	return pos;
 }
 
@@ -696,7 +729,7 @@ static void lookup_work_fn(struct work_struct *work)
 		}
 		cr->registered = true;
 		dev_info(cr->dev, "sns client registered\n");
-		schedule_delayed_work(&cr->session_work, 0);
+		schedule_delayed_work(&cr->aon_work, 0);
 	}
 	return;
 
@@ -733,48 +766,24 @@ static bool camres_parse_ctrl(struct oplus_camres *cr, const u8 *buf,
 		}
 	} else if (service == SNS_SERVICE_ID && cr->sns_found &&
 		   cr->sns_sq.sq_node == node && cr->sns_sq.sq_port == port) {
-		bool was_ready = cr->session_ready;
-
 		dev_info(cr->dev, "SEE service restart\n");
 		cr->sns_found = false;
 		cr->registered = false;		/* SEE restart drops it */
-		cr->hs_ready = false;
-		cr->hs_ok = false;
 		cr->aon_armed = false;
-		cr->session_ready = false;
-		if (was_ready)
-			kobject_uevent_env(&cr->dev->kobj, KOBJ_CHANGE,
-					   (char *[]){ "CAMRES_READY=0", NULL });
+		/*
+		 * The arbitration session died with the SEE.  Fall back to
+		 * the unconfigured (AP-held) mode; userspace re-runs the
+		 * DEINIT/INIT cycle on the uevent if it wants arbitration.
+		 */
+		mutex_lock(&cr->lock);
+		if (cr->state == CAMRES_CONFIGURED)
+			cr->state = CAMRES_UNCONFIGURED;
+		mutex_unlock(&cr->lock);
+		kobject_uevent_env(&cr->dev->kobj, KOBJ_CHANGE,
+				   (char *[]){ "CAMRES_SEE_RESTART=1", NULL });
 		schedule_delayed_work(&cr->lookup_work, 0);
 	}
 	return true;
-}
-
-/*
- * Attach to SEE's camera session.  Returns 0 only when SEE acked with
- * error == 0 (the session exists and the camera power domain is up).
- */
-static int sns_attach(struct oplus_camres *cr)
-{
-	u8 body[32];
-	size_t len;
-	int ret;
-
-	if (!cr->registered)
-		return -ENOTCONN;
-
-	len = sns_body_init(body, cr->attach_name, cr->attach_slot);
-	ret = sns_xfer(cr, cr->suid_lo, cr->suid_hi, QSH_INIT, body, len,
-		       QSH_INIT_ACK);
-	if (ret)
-		return ret;
-	if (cr->ack_error) {
-		dev_info(cr->dev, "sns attach rejected: error=%u\n",
-			 cr->ack_error);
-		return -EPROTO;
-	}
-	dev_info(cr->dev, "sns attach ok (state=%u)\n", cr->ack_state);
-	return 0;
 }
 
 static int sns_simple(struct oplus_camres *cr, u32 msg, u32 ack,
@@ -856,132 +865,58 @@ static void sns_release_notify(struct oplus_camres *cr)
 		dev_warn(cr->dev, "SEE release notify failed\n");
 }
 
-/* ---- SEE camera session readiness ---- */
+/* ---- AON subscribe (camera module power) ---- */
 
 static int takeover_locked(struct oplus_camres *cr, bool negotiate);
 
-static int camres_reprobe_child(struct device *dev, void *data)
+/*
+ * Unsubscribe the AON camera report (disable message 10, the wire form
+ * libssc's close uses).  Fire-and-forget like the userspace client.
+ */
+static void sns_aon_power_off(struct oplus_camres *cr)
 {
-	int ret;
+	if (!cr->registered || !cr->aon_armed)
+		return;
 
-	if (dev->driver)
-		return 0;
-
-	ret = device_attach(dev);
-	dev_dbg(dev, "camres reprobe: %d\n", ret);
-	return 0;
+	if (sns_send(cr, SNS_AON_UID_LO, SNS_AON_UID_HI,
+		     SNS_MSG_SENSOR_DISABLE, NULL, 0))
+		dev_warn(cr->dev, "SEE AON unsubscribe failed\n");
+	cr->aon_armed = false;
 }
 
 /*
- * Called without cr->lock: the children's probes acquire the bus and
- * take the lock themselves.
+ * Best-effort AON subscribe, retried in the background: the camera
+ * module is powered through it, and once it stands REVOKE is
+ * answerable.  Runs whenever the SNS service is (re)discovered or
+ * after a handback that needs re-arming; not a precondition for the
+ * bus itself — UNCONFIGURED works without it.
  */
-static void camres_session_up(struct oplus_camres *cr)
-{
-	dev_info(cr->dev, "SEE camera session up\n");
-	kobject_uevent_env(&cr->dev->kobj, KOBJ_CHANGE,
-			   (char *[]){ "CAMRES_READY=1", NULL });
-	/* consumers that deferred on !is_ready() get no other trigger */
-	device_for_each_child(&cr->adapter.dev, NULL, camres_reprobe_child);
-}
-
-/*
- * SNS registration only proves the ADSP is up.  SEE does not answer the
- * camera handshake until adsprpcd has served its camera config, so poll
- * here until it does:
- *
- *   - INIT without any ACK: adsprpcd is not serving yet — retry.
- *   - INIT ACKed with an error (e.g. the module .pb is missing): the
- *     service is alive — continue; vendor tolerates this too.
- *   - AON subscribe acked: the module is powered and REVOKE is armed.
- *
- * Each step is retried on its own; completed steps are not redone.
- */
-static void session_work_fn(struct work_struct *work)
+static void aon_work_fn(struct work_struct *work)
 {
 	struct oplus_camres *cr = container_of(to_delayed_work(work),
-					       struct oplus_camres,
-					       session_work);
+					       struct oplus_camres, aon_work);
 	int ret;
 
+	if (!cr->registered || cr->aon_armed)
+		return;
+
 	mutex_lock(&cr->lock);
-	if (cr->session_ready)
-		goto out_unlock;
-
-	if (cr->ap_active) {
-		/*
-		 * AP holds the bus: SEE would reject the AON subscribe
-		 * ("camera is acquired").  release_locked re-arms the
-		 * session once the bus is handed back — do not claim
-		 * readiness without the subscribe standing.
-		 */
-		goto out_unlock;
+	if (cr->state == CAMRES_CONFIGURING) {
+		/* DEINIT in flight: resubscribe happens at INIT */
+		mutex_unlock(&cr->lock);
+		return;
 	}
-
-	if (!cr->registered)
-		goto out_unlock;	/* lookup_work reschedules us */
-
-	if (!cr->hs_ready) {
-		ret = sns_attach(cr);
-		if (ret == -ETIMEDOUT) {
-			mutex_unlock(&cr->lock);
-			dev_info(cr->dev,
-				 "SEE camera session not up yet (%d)\n",
-				 ret);
-			schedule_delayed_work(&cr->session_work,
-					      msecs_to_jiffies(SESSION_RETRY_MS));
-			return;
-		}
-		if (!ret) {
-			sns_release_notify(cr);
-			cr->hs_ok = true;
-		} else {
-			/*
-			 * ACKed with an error: the service answered,
-			 * only its config is short (no module .pb) —
-			 * keep going, but without a valid session
-			 * REVOKE/RELEASE must not be sent.
-			 */
-			dev_warn(cr->dev,
-				 "SEE attach rejected (%d): continuing\n",
-				 ret);
-		}
-		cr->hs_ready = true;
-	}
+	mutex_unlock(&cr->lock);
 
 	ret = sns_aon_power_on(cr);
 	if (ret) {
-		mutex_unlock(&cr->lock);
-		dev_info(cr->dev,
-			 "SEE AON subscribe not up yet (%d)\n", ret);
-		schedule_delayed_work(&cr->session_work,
-				      msecs_to_jiffies(SESSION_RETRY_MS));
+		dev_info(cr->dev, "SEE AON subscribe pending (%d)\n", ret);
+		schedule_delayed_work(&cr->aon_work,
+				      msecs_to_jiffies(AON_RETRY_MS));
 		return;
 	}
 	cr->aon_armed = true;
-	cr->session_ready = true;
-	if (!cr->hs_ok) {
-		/*
-		 * Classified as no-PB (INIT answered with an error):
-		 * SEE arbitration is impossible — REVOKE/RELEASE have no
-		 * session to act on.  The AON subscribe above is the only
-		 * SEE dependency left (it powers the module) and stands;
-		 * take the bus once, hold it for good, and let
-		 * acquire/release reduce to no-ops (release_work checks
-		 * the same hs_ready && !hs_ok condition).
-		 */
-		dev_info(cr->dev, "no SEE handshake: camera bus held to AP\n");
-		ret = takeover_locked(cr, false);
-		if (ret)
-			dev_warn(cr->dev, "AP hold failed (%d)\n", ret);
-	}
-	mutex_unlock(&cr->lock);
-
-	camres_session_up(cr);
-	return;
-
-out_unlock:
-	mutex_unlock(&cr->lock);
+	dev_info(cr->dev, "SEE AON subscribed (camera module powered)\n");
 }
 
 /* ---- dynamic geni_i2c instantiation ---- */
@@ -1091,7 +1026,7 @@ static void camres_uevent(struct oplus_camres *cr, const char *owner)
 	kobject_uevent_env(&cr->dev->kobj, KOBJ_CHANGE, envp);
 }
 
-/* called with cr->lock held; @negotiate: run the SEE handshake first */
+/* called with cr->lock held; @negotiate: run the SEE takeover sequence */
 static int takeover_locked(struct oplus_camres *cr, bool negotiate)
 {
 	int ret;
@@ -1099,35 +1034,19 @@ static int takeover_locked(struct oplus_camres *cr, bool negotiate)
 	if (cr->ap_active)
 		return 0;
 
-	if (negotiate) {
-		if (!cr->session_ready) {
-			dev_warn(cr->dev, "SEE session not ready\n");
-			return -ENOTCONN;
-		}
+	if (negotiate && revoke && cr->state == CAMRES_CONFIGURED &&
+	    cr->aon_armed) {
 		/*
-		 * The AON subscribe that powers the module happened at
-		 * session bring-up and stays standing; REVOKE is only
-		 * answerable while it does, and only from a valid
-		 * handshake session — an out-of-session REVOKE takes the
-		 * SEE service down with it.  AON requests die after a
-		 * successful REVOKE, so there is nothing to (re)enable.
+		 * REVOKE is only answerable while the AON subscribe
+		 * stands, and only from a valid handshake session (which
+		 * userspace established via INIT) — an out-of-session
+		 * REVOKE takes the SEE service down with it.  AON requests
+		 * die after a successful REVOKE, so there is nothing to
+		 * (re)enable.
 		 */
-		if (revoke) {
-			if (!cr->aon_armed) {
-				dev_info(cr->dev,
-					 "SEE revoke skipped: AON not subscribed\n");
-			} else if (!cr->hs_ok) {
-				dev_info(cr->dev,
-					 "SEE revoke skipped: no handshake session\n");
-			} else {
-				ret = sns_simple(cr, QSH_REVOKE,
-						 QSH_REVOKE_ACK, NULL, 0);
-				if (ret)
-					dev_warn(cr->dev,
-						 "SEE revoke failed (%d)\n",
-						 ret);
-			}
-		}
+		ret = sns_simple(cr, QSH_REVOKE, QSH_REVOKE_ACK, NULL, 0);
+		if (ret)
+			dev_warn(cr->dev, "SEE revoke failed (%d)\n", ret);
 	}
 
 	ret = pinctrl_select_state(cr->pctl, cr->p_active);
@@ -1145,8 +1064,6 @@ static int takeover_locked(struct oplus_camres *cr, bool negotiate)
 	cr->ap_active = true;
 	dev_info(cr->dev, "camera bus acquired by AP\n");
 	camres_uevent(cr, "AP");
-	if (!cr->session_ready)
-		schedule_delayed_work(&cr->session_work, 0);
 	return 0;
 
 err_geni:
@@ -1188,7 +1105,7 @@ static int release_locked(struct oplus_camres *cr)
 	geni_destroy(cr);
 
 	dev_info(cr->dev, "camera bus released to SEE\n");
-	if (cr->hs_ok)
+	if (cr->state == CAMRES_CONFIGURED)
 		sns_release_notify(cr);
 	camres_uevent(cr, "SEE");
 	/*
@@ -1196,10 +1113,15 @@ static int release_locked(struct oplus_camres *cr)
 	 * power) is gone; re-arm it now that SEE owns the bus again.
 	 */
 	if (cr->registered && !cr->aon_armed)
-		schedule_delayed_work(&cr->session_work, 0);
+		schedule_delayed_work(&cr->aon_work, 0);
 	return 0;
 }
 
+/*
+ * The single natural handback path: only CONFIGURED gives the bus back
+ * (UNCONFIGURED and ERR hold it for good), and only once every vote is
+ * gone.
+ */
 static void release_work_fn(struct work_struct *work)
 {
 	struct oplus_camres *cr = container_of(to_delayed_work(work),
@@ -1207,9 +1129,8 @@ static void release_work_fn(struct work_struct *work)
 					       release_work);
 
 	mutex_lock(&cr->lock);
-	/* no-PB (hs_ready && !hs_ok): the bus stays with the AP for good */
-	if (!atomic_read(&cr->consumers) && !cr->force && cr->ap_active &&
-	    !(cr->hs_ready && !cr->hs_ok)) {
+	if (cr->state == CAMRES_CONFIGURED && cr->ap_active &&
+	    !atomic_read(&cr->consumers)) {
 		if (release_locked(cr))
 			schedule_delayed_work(&cr->release_work,
 					      msecs_to_jiffies(200));
@@ -1246,34 +1167,75 @@ static const struct i2c_algorithm camres_i2c_algo = {
 	.functionality = camres_i2c_func,
 };
 
-/* ---- public API ---- */
+/* ---- votes (the single ownership oracle) ---- */
+
+/*
+ * One vote through the common path: state gate, then takeover.  Every
+ * AP user funnels through here — the public kernel API, the misc
+ * device ioctls, the sysfs manual vote and the probe-window votes.
+ * While CONFIGURING the caller sleeps until userspace resolves the
+ * state (INIT or the owner dying); ERR is a hard error until a fresh
+ * DEINIT/INIT cycle recovers the bus.
+ */
+static int camres_acquire_vote(struct oplus_camres *cr)
+{
+	int ret;
+
+	mutex_lock(&cr->lock);
+	for (;;) {
+		enum camres_state state = READ_ONCE(cr->state);
+
+		if (state == CAMRES_ERR) {
+			mutex_unlock(&cr->lock);
+			return -EIO;
+		}
+		if (state != CAMRES_CONFIGURING)
+			break;
+		mutex_unlock(&cr->lock);
+		if (wait_event_interruptible(cr->state_wq,
+					     READ_ONCE(cr->state) !=
+					     CAMRES_CONFIGURING))
+			return -EINTR;
+		mutex_lock(&cr->lock);
+	}
+
+	ret = takeover_locked(cr, READ_ONCE(cr->state) == CAMRES_CONFIGURED);
+	if (ret) {
+		mutex_unlock(&cr->lock);
+		return ret;
+	}
+	atomic_inc(&cr->consumers);
+	mutex_unlock(&cr->lock);
+	return 0;
+}
+
+static void camres_release_vote(struct oplus_camres *cr)
+{
+	if (atomic_dec_if_positive(&cr->consumers) == 0) {
+		/* a waiting DEINIT learns the last vote is gone */
+		wake_up_interruptible_all(&cr->state_wq);
+		mod_delayed_work(system_wq, &cr->release_work,
+				 msecs_to_jiffies(RELEASE_IDLE_MS));
+	}
+}
+
+/* ---- public API (kept for drivers with exotic probe strategies) ---- */
 
 int oplus_camres_acquire(struct device *consumer)
 {
-	struct oplus_camres *cr = g_camres;
-	int ret;
-
-	if (!cr)
+	if (!g_camres)
 		return -EPROBE_DEFER;
 
-	mutex_lock(&cr->lock);
-	ret = takeover_locked(cr, true);
-	if (!ret)
-		atomic_inc(&cr->consumers);
-	mutex_unlock(&cr->lock);
-	return ret;
+	return camres_acquire_vote(g_camres);
 }
 EXPORT_SYMBOL_GPL(oplus_camres_acquire);
 
 int oplus_camres_release(struct device *consumer)
 {
-	struct oplus_camres *cr = g_camres;
-
-	if (!cr)
+	if (!g_camres)
 		return -ENODEV;
 
-	if (atomic_dec_if_positive(&cr->consumers) == 0 && !cr->force)
-		schedule_delayed_work(&cr->release_work, 0);
+	camres_release_vote(g_camres);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(oplus_camres_release);
@@ -1284,86 +1246,369 @@ bool oplus_camres_ap_holds(void)
 }
 EXPORT_SYMBOL_GPL(oplus_camres_ap_holds);
 
-/*
- * True once the session bring-up completed: SEE answered INIT (an ACK
- * carrying only a config error still counts — the service is up) and
- * the AON subscribe that powers the module was acked.  This needs the
- * ADSP up *and* adsprpcd serving.  Consumers defer their probe while
- * this is false; when it turns true camres reprobes its unbound
- * children and emits a KOBJ_CHANGE uevent (CAMRES_READY=1).
- */
+/* the bus is usable (not in the ERR state) */
 bool oplus_camres_is_ready(void)
 {
 	struct oplus_camres *cr = g_camres;
 
-	return cr && READ_ONCE(cr->session_ready);
+	return cr && READ_ONCE(cr->state) != CAMRES_ERR;
 }
 EXPORT_SYMBOL_GPL(oplus_camres_is_ready);
 
+/* ---- child hooks: runtime PM links + exact probe-boundary votes ---- */
+
+static struct camres_child *camres_child_find(struct oplus_camres *cr,
+					      struct device *dev)
+{
+	struct camres_child *child;
+
+	list_for_each_entry(child, &cr->children, node)
+		if (child->dev == dev)
+			return child;
+	return NULL;
+}
+
+/*
+ * I2C sensor drivers power their devices on directly inside probe(),
+ * before runtime PM is in play — a PM_RUNTIME device link alone cannot
+ * cover that window.  The bus notifier gives the exact boundaries:
+ * BIND_DRIVER runs inline on the probing thread right before ->probe()
+ * (blocking here queues the probe), BOUND_DRIVER/BIND_FAILED run right
+ * after it.  A child with no driver in the system never reaches
+ * BIND_DRIVER, so it never takes a vote and never pins the bus.
+ */
+static int camres_bus_notify(struct notifier_block *nb, unsigned long action,
+			     void *data)
+{
+	struct oplus_camres *cr = container_of(nb, struct oplus_camres, nb);
+	struct device *dev = data;
+	struct camres_child *child;
+
+	if (dev->parent != &cr->adapter.dev)
+		return NOTIFY_DONE;
+
+	switch (action) {
+	case BUS_NOTIFY_ADD_DEVICE:
+		child = kzalloc(sizeof(*child), GFP_KERNEL);
+		if (!child)
+			return NOTIFY_DONE;
+		child->dev = dev;
+		/* pure ordering, no usage references taken */
+		child->link = device_link_add(cr->dev, dev,
+					 DL_FLAG_PM_RUNTIME |
+				 DL_FLAG_AUTOREMOVE_CONSUMER);
+		list_add(&child->node, &cr->children);
+		break;
+	case BUS_NOTIFY_BIND_DRIVER:
+		child = camres_child_find(cr, dev);
+		if (child && !child->probe_vote) {
+			child->probe_vote = true;
+			camres_acquire_vote(cr);
+		}
+		break;
+	case BUS_NOTIFY_BOUND_DRIVER:
+	case BUS_NOTIFY_DRIVER_NOT_BOUND:
+		child = camres_child_find(cr, dev);
+		if (child && child->probe_vote) {
+			child->probe_vote = false;
+			camres_release_vote(cr);
+		}
+		break;
+	case BUS_NOTIFY_DEL_DEVICE:
+		child = camres_child_find(cr, dev);
+		if (child) {
+			if (child->probe_vote)
+				camres_release_vote(cr);
+			if (child->link)
+				device_link_del(child->link);
+			list_del(&child->node);
+			kfree(child);
+		}
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+/* ---- /dev/camres ---- */
+
+static int camres_open(struct inode *inode, struct file *file)
+{
+	struct camres_file *priv;
+
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+	priv->cr = g_camres;
+	if (!priv->cr) {
+		kfree(priv);
+		return -ENODEV;
+	}
+	file->private_data = priv;
+	return 0;
+}
+
+/*
+ * fd teardown: an ACQUIRE vote dies with its fd, and so does an
+ * unfinished DEINIT — the bus enters ERR until a fresh DEINIT/INIT
+ * cycle recovers it.
+ */
+static int camres_release(struct inode *inode, struct file *file)
+{
+	struct camres_file *priv = file->private_data;
+	struct oplus_camres *cr = priv->cr;
+
+	mutex_lock(&cr->lock);
+	if (priv->owner) {
+		if (cr->state == CAMRES_CONFIGURING) {
+			cr->state = CAMRES_ERR;
+			cr->owner = NULL;
+			dev_err(cr->dev,
+				"deinit owner died before init: bus in ERR\n");
+			/* queued acquires wake up and fail */
+			wake_up_interruptible_all(&cr->state_wq);
+		}
+		priv->owner = false;
+	}
+	mutex_unlock(&cr->lock);
+
+	if (priv->vote)
+		camres_release_vote(cr);
+
+	kfree(priv);
+	return 0;
+}
+
+static long camres_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct camres_file *priv = file->private_data;
+	struct oplus_camres *cr = priv->cr;
+	long ret;
+
+	/* node permissions are the only authority */
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EACCES;
+
+	switch (cmd) {
+	case CAMRES_IOC_ACQUIRE:
+		if (priv->vote)
+			return 1;
+		ret = camres_acquire_vote(cr);
+		if (!ret)
+			priv->vote = true;
+		return ret;
+	case CAMRES_IOC_RELEASE:
+		if (!priv->vote)
+			return -EINVAL;
+		priv->vote = false;
+		camres_release_vote(cr);
+		return 0;
+	case CAMRES_IOC_DEINIT:
+		mutex_lock(&cr->lock);
+		if (cr->state == CAMRES_CONFIGURING) {
+			ret = priv->owner && cr->deinit_done ? 1 : -EBUSY;
+			mutex_unlock(&cr->lock);
+			return ret;
+		}
+		if (cr->state == CAMRES_ERR)
+			dev_info(cr->dev, "ERR recovery: new deinit cycle\n");
+		cr->state = CAMRES_CONFIGURING;
+		cr->deinit_done = false;
+		cr->owner = priv;
+		priv->owner = true;
+		mutex_unlock(&cr->lock);
+
+		/*
+		 * Block until the last AP user is done: explicit votes
+		 * (ioctls, kernel API, sysfs, probe windows) are counted
+		 * in ->consumers, device-link users in the runtime PM
+		 * usage of this device.  New acquires queue on the state
+		 * change instead of taking the bus.  Wakes come from the
+		 * vote-release path and the runtime-suspend completion.
+		 */
+		ret = wait_event_interruptible(cr->state_wq,
+				atomic_read(&cr->consumers) == 0 &&
+				pm_runtime_suspended(cr->dev));
+		if (ret) {
+			mutex_lock(&cr->lock);
+			if (cr->owner == priv &&
+			    cr->state == CAMRES_CONFIGURING && !cr->deinit_done) {
+				cr->state = CAMRES_UNCONFIGURED;
+				cr->owner = NULL;
+				priv->owner = false;
+				wake_up_interruptible_all(&cr->state_wq);
+			}
+			mutex_unlock(&cr->lock);
+			return -EINTR;
+		}
+
+		cancel_delayed_work_sync(&cr->release_work);
+		mutex_lock(&cr->lock);
+		if (cr->owner != priv || cr->state != CAMRES_CONFIGURING) {
+			mutex_unlock(&cr->lock);
+			return -EBUSY;
+		}
+		/*
+		 * Every user is gone; hand the bus to the SEE now (the
+		 * normal idle-release paths stay out of CONFIGURING) and
+		 * unsubscribe the AON camera report.
+		 */
+		if (cr->ap_active && release_locked(cr))
+			dev_warn(cr->dev, "deinit: handback deferred\n");
+		sns_aon_power_off(cr);
+		cr->deinit_done = true;
+		mutex_unlock(&cr->lock);
+		return 0;
+	case CAMRES_IOC_INIT: {
+		__s32 ack;
+		enum camres_state state;
+
+		if (copy_from_user(&ack, (void __user *)arg, sizeof(ack)))
+			return -EFAULT;
+
+		mutex_lock(&cr->lock);
+		state = cr->state;
+		if (!priv->owner || state != CAMRES_CONFIGURING) {
+			mutex_unlock(&cr->lock);
+			return state == CAMRES_UNCONFIGURED ||
+			       state == CAMRES_CONFIGURED ? 1 : -EACCES;
+		}
+		cr->owner = NULL;
+		priv->owner = false;
+
+		if (ack == 0) {
+			cr->state = CAMRES_CONFIGURED;
+			dev_info(cr->dev, "configured: SEE arbitration active\n");
+		} else {
+			/* vendor tolerance: keep the camera, drop arbitration */
+			cr->state = CAMRES_UNCONFIGURED;
+			dev_info(cr->dev,
+				 "INIT rejected (ack %d): staying unconfigured\n",
+				 ack);
+		}
+		mutex_unlock(&cr->lock);
+
+		/* re-arm the AON subscribe either way */
+		schedule_delayed_work(&cr->aon_work, 0);
+		wake_up_interruptible_all(&cr->state_wq);
+		return 0;
+	}
+	default:
+		return -ENOTTY;
+	}
+}
+
+static const struct file_operations camres_fops = {
+	.owner = THIS_MODULE,
+	.open = camres_open,
+	.release = camres_release,
+	.unlocked_ioctl = camres_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
+};
+
 /* ---- sysfs ---- */
 
-static int force_set(struct oplus_camres *cr, bool val)
+static ssize_t ap_hold_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
 {
-	int ret = 0;
-
-	if (val && !cr->force) {
-		cr->force = true;
-		ret = takeover_locked(cr, true);
-		if (ret)
-			cr->force = false;
-	} else if (!val && cr->force) {
-		cr->force = false;
-		if (!atomic_read(&cr->consumers))
-			schedule_delayed_work(&cr->release_work, 0);
-	}
-	return ret;
+	return sysfs_emit(buf, "%d\n", oplus_camres_ap_holds());
 }
 
-static ssize_t force_start_i2c_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct oplus_camres *cr = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%d\n", cr->force);
-}
-
-static ssize_t force_start_i2c_store(struct device *dev,
-				     struct device_attribute *attr,
-				     const char *buf, size_t count)
+static ssize_t ap_hold_store(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t count)
 {
 	struct oplus_camres *cr = dev_get_drvdata(dev);
 	bool val;
 	int ret;
-
-	/* taking the bus from the SEE is a privileged operation */
-	if (!capable(CAP_SYS_ADMIN))
-		return -EPERM;
 
 	ret = kstrtobool(buf, &val);
 	if (ret)
 		return ret;
 
 	mutex_lock(&cr->lock);
-	ret = force_set(cr, val);
+	if (val) {
+		if (!cr->manual_ap) {
+			cr->manual_ap = true;
+			mutex_unlock(&cr->lock);
+			ret = camres_acquire_vote(cr);
+			if (ret)
+				cr->manual_ap = false;
+			else
+				return count;
+			return ret ?: count;
+		}
+	} else {
+		if (READ_ONCE(cr->state) == CAMRES_UNCONFIGURED) {
+			mutex_unlock(&cr->lock);
+			return -EOPNOTSUPP;
+		}
+		if (cr->manual_ap) {
+			cr->manual_ap = false;
+			mutex_unlock(&cr->lock);
+			camres_release_vote(cr);
+			return count;
+		}
+	}
 	mutex_unlock(&cr->lock);
-	return ret ? ret : count;
+	return count;
 }
-static struct device_attribute dev_attr_force_start_i2c =
-	__ATTR(force_start_i2c, 0600, force_start_i2c_show, force_start_i2c_store);
-
-static ssize_t ap_holds_show(struct device *dev,
-			     struct device_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "%d\n", oplus_camres_ap_holds());
-}
-static DEVICE_ATTR_RO(ap_holds);
+static struct device_attribute dev_attr_ap_hold =
+	__ATTR(ap_hold, 0600, ap_hold_show, ap_hold_store);
 
 static struct attribute *camres_attrs[] = {
-	&dev_attr_force_start_i2c.attr,
-	&dev_attr_ap_holds.attr,
+	&dev_attr_ap_hold.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(camres);
+
+/* ---- runtime PM (the supplier side of the child links) ---- */
+
+static int camres_runtime_resume(struct device *dev)
+{
+	struct oplus_camres *cr = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&cr->lock);
+	while (READ_ONCE(cr->state) == CAMRES_CONFIGURING) {
+		mutex_unlock(&cr->lock);
+		/*
+		 * Uninterruptible: runtime PM has nowhere to propagate a
+		 * signal; the wait ends with userspace INIT or owner
+		 * death (which wakes and fails us through ERR).
+		 */
+		wait_event(cr->state_wq,
+			   READ_ONCE(cr->state) != CAMRES_CONFIGURING);
+		mutex_lock(&cr->lock);
+	}
+	if (READ_ONCE(cr->state) == CAMRES_ERR) {
+		mutex_unlock(&cr->lock);
+		return -EIO;
+	}
+	ret = takeover_locked(cr, READ_ONCE(cr->state) == CAMRES_CONFIGURED);
+	mutex_unlock(&cr->lock);
+	return ret;
+}
+
+static int camres_runtime_suspend(struct device *dev)
+{
+	struct oplus_camres *cr = dev_get_drvdata(dev);
+	int ret = 0;
+
+	mutex_lock(&cr->lock);
+	/* only the configured state hands an idle bus back to the SEE;
+	 * a DEINIT in progress forces its own handback after the wait */
+	if (cr->state == CAMRES_CONFIGURED && cr->ap_active)
+		ret = release_locked(cr);
+	mutex_unlock(&cr->lock);
+
+	/* the DEINIT waiter counts on this transition */
+	wake_up_interruptible_all(&cr->state_wq);
+	return ret;
+}
+
+static const struct dev_pm_ops camres_pm_ops = {
+	RUNTIME_PM_OPS(camres_runtime_suspend, camres_runtime_resume, NULL)
+};
 
 /* ---- platform driver ---- */
 
@@ -1371,7 +1616,6 @@ static int oplus_camres_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct oplus_camres *cr;
-	const char *name = NULL;
 	int ret;
 
 	cr = devm_kzalloc(dev, sizeof(*cr), GFP_KERNEL);
@@ -1381,15 +1625,15 @@ static int oplus_camres_probe(struct platform_device *pdev)
 	cr->dev = dev;
 	cr->suid_hi = 0xa7167528f835f4eeULL;	/* camera_handshake */
 	cr->suid_lo = 0xe0e3f77b504b96a1ULL;
-	strscpy(cr->attach_name, CAMRES_ATTACH_NAME, sizeof(cr->attach_name));
-	cr->attach_slot = CAMRES_ATTACH_SLOT;
 	mutex_init(&cr->lock);
 	atomic_set(&cr->consumers, 0);
 	INIT_DELAYED_WORK(&cr->release_work, release_work_fn);
 	INIT_DELAYED_WORK(&cr->lookup_work, lookup_work_fn);
-	INIT_DELAYED_WORK(&cr->session_work, session_work_fn);
+	INIT_DELAYED_WORK(&cr->aon_work, aon_work_fn);
 	INIT_WORK(&cr->rx_work, rx_work_fn);
 	init_waitqueue_head(&cr->rx_wq);
+	init_waitqueue_head(&cr->state_wq);
+	INIT_LIST_HEAD(&cr->children);
 	mutex_init(&cr->sns_lock);
 	spin_lock_init(&cr->ack_lock);
 	init_completion(&cr->ack_done);
@@ -1401,21 +1645,10 @@ static int oplus_camres_probe(struct platform_device *pdev)
 
 	of_property_read_u64(dev->of_node, "sns,suid-hi", &cr->suid_hi);
 	of_property_read_u64(dev->of_node, "sns,suid-lo", &cr->suid_lo);
-	of_property_read_string(dev->of_node, "sns,attach-name", &name);
-	if (name)
-		strscpy(cr->attach_name, name, sizeof(cr->attach_name));
-	of_property_read_u32(dev->of_node, "sns,attach-slot", &cr->attach_slot);
-
-	/* experiment overrides */
 	if (suid_hi)
 		cr->suid_hi = suid_hi;
 	if (suid_lo)
 		cr->suid_lo = suid_lo;
-	if (attach_name && attach_name[0])
-		strscpy(cr->attach_name, attach_name,
-			sizeof(cr->attach_name));
-	if (attach_slot >= 0)
-		cr->attach_slot = attach_slot;
 
 	cr->pctl = devm_pinctrl_get(dev);
 	if (IS_ERR(cr->pctl))
@@ -1432,13 +1665,6 @@ static int oplus_camres_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(cr->p_released),
 				     "missing released pinctrl state\n");
 
-	/*
-	 * Boot state: the bus belongs to SEE.  Nothing in DT occupies
-	 * gpio4/5, so the bootloader's high-Z simply persists — no
-	 * pinctrl action here.  States are only selected around
-	 * takeovers.
-	 */
-
 	cr->adapter.owner = THIS_MODULE;
 	cr->adapter.algo = &camres_i2c_algo;
 	cr->adapter.dev.parent = dev;
@@ -1448,27 +1674,92 @@ static int oplus_camres_probe(struct platform_device *pdev)
 		sizeof(cr->adapter.name));
 	i2c_set_adapdata(&cr->adapter, cr);
 
+	/*
+	 * Boot state: UNCONFIGURED — the AP takes the bus right away so
+	 * the camera works with zero userspace.  Children probing against
+	 * it are covered by the BIND_DRIVER votes from the notifier
+	 * registered below (before any child can appear).
+	 */
+	cr->state = CAMRES_UNCONFIGURED;
+	mutex_lock(&cr->lock);
+	ret = takeover_locked(cr, false);
+	mutex_unlock(&cr->lock);
+	if (ret)
+		return dev_err_probe(dev, ret, "boot takeover failed\n");
+
+	cr->nb.notifier_call = camres_bus_notify;
+	ret = bus_register_notifier(&i2c_bus_type, &cr->nb);
+	if (ret)
+		goto err_release;
+
 	ret = i2c_add_adapter(&cr->adapter);
 	if (ret)
-		return dev_err_probe(dev, ret, "failed to add i2c adapter\n");
+		goto err_notifier;
 
-	/* resident SNS client: discover + register in the background */
+	cr->misc.minor = MISC_DYNAMIC_MINOR;
+	cr->misc.name = "camres";
+	cr->misc.fops = &camres_fops;
+	cr->misc.parent = dev;
+	ret = misc_register(&cr->misc);
+	if (ret)
+		goto err_adapter;
+
+	/*
+	 * Runtime PM: autosuspend hands an idle CONFIGURED bus to the
+	 * SEE; in the other states the suspend callback is a no-op, so
+	 * no reference is pinned here — UNCONFIGURED and ERR keep the
+	 * bus through ->ap_active and the state gates alone, and the
+	 * DEINIT wait can observe "suspended" uniformly.
+	 */
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
+	pm_runtime_set_autosuspend_delay(dev, RELEASE_IDLE_MS);
+	pm_runtime_use_autosuspend(dev);
+
+	/* resident SNS client: discover + AON subscribe in the background */
 	schedule_delayed_work(&cr->lookup_work, 0);
 
 	g_camres = cr;
-	dev_info(dev, "camera bus ready, released to SEE (bus %d)\n",
+	dev_info(dev, "camera bus ready, held to AP (bus %d)\n",
 		 i2c_adapter_id(&cr->adapter));
 	return 0;
+
+err_adapter:
+	i2c_del_adapter(&cr->adapter);
+err_notifier:
+	bus_unregister_notifier(&i2c_bus_type, &cr->nb);
+err_release:
+	mutex_lock(&cr->lock);
+	if (cr->ap_active)
+		release_locked(cr);
+	mutex_unlock(&cr->lock);
+	return ret;
 }
 
 static void oplus_camres_remove(struct platform_device *pdev)
 {
 	struct oplus_camres *cr = platform_get_drvdata(pdev);
+	struct camres_child *child, *tmp;
 
 	g_camres = NULL;
 	cancel_delayed_work_sync(&cr->release_work);
 	cancel_delayed_work_sync(&cr->lookup_work);
-	cancel_delayed_work_sync(&cr->session_work);
+	cancel_delayed_work_sync(&cr->aon_work);
+
+	pm_runtime_disable(cr->dev);
+
+	misc_deregister(&cr->misc);
+	i2c_del_adapter(&cr->adapter);
+	bus_unregister_notifier(&i2c_bus_type, &cr->nb);
+
+	list_for_each_entry_safe(child, tmp, &cr->children, node) {
+		if (child->probe_vote)
+			camres_release_vote(cr);
+		if (child->link)
+			device_link_del(child->link);
+		list_del(&child->node);
+		kfree(child);
+	}
 
 	mutex_lock(&cr->lock);
 	if (cr->ap_active) {
@@ -1481,7 +1772,6 @@ static void oplus_camres_remove(struct platform_device *pdev)
 	}
 	mutex_unlock(&cr->lock);
 
-	i2c_del_adapter(&cr->adapter);
 	sns_socket_close(cr);
 	of_node_put(cr->geni_np);
 }
@@ -1499,6 +1789,7 @@ static struct platform_driver oplus_camres_driver = {
 		.name = "oplus-camres",
 		.of_match_table = oplus_camres_of_match,
 		.dev_groups = camres_groups,
+		.pm = pm_ptr(&camres_pm_ops),
 	},
 };
 module_platform_driver(oplus_camres_driver);
