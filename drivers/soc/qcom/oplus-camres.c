@@ -278,9 +278,7 @@ struct oplus_camres {
 	struct device *dev;
 
 	struct mutex lock;
-	struct mutex manual_lock;	/* serializes the sysfs manual vote */
-	atomic_t consumers;	/* runtime/ACQUIRE/probe/manual votes */
-	bool manual_ap;		/* sysfs manual vote active */
+	atomic_t consumers;	/* the single vote counter */
 	enum camres_state state;
 	struct camres_file *owner;	/* CONFIGURING deinit owner */
 	bool deinit_done;	/* CONFIGURING: AON unsubscribed, wait done */
@@ -298,6 +296,7 @@ struct oplus_camres {
 
 	struct i2c_adapter adapter;	/* the oplus,camres bus itself */
 	struct delayed_work release_work;
+	struct workqueue_struct *wq;	/* dedicated, avoids system_wq */
 	struct notifier_block nb;	/* i2c bus notifier (children) */
 	struct list_head children;	/* camres_child list */
 
@@ -742,7 +741,7 @@ static void lookup_work_fn(struct work_struct *work)
 		}
 		cr->registered = true;
 		dev_info(cr->dev, "sns client registered\n");
-		schedule_delayed_work(&cr->aon_work, 0);
+		queue_delayed_work(cr->wq, &cr->aon_work, 0);
 	}
 	return;
 
@@ -759,7 +758,7 @@ retry:
 		camres_boot_done(cr);
 		return;
 	}
-	schedule_delayed_work(&cr->lookup_work,
+	queue_delayed_work(cr->wq, &cr->lookup_work,
 			      msecs_to_jiffies(LOOKUP_RETRY_MS));
 }
 
@@ -806,7 +805,7 @@ static bool camres_parse_ctrl(struct oplus_camres *cr, const u8 *buf,
 		mutex_unlock(&cr->lock);
 		kobject_uevent_env(&cr->dev->kobj, KOBJ_CHANGE,
 				   (char *[]){ "CAMRES_SEE_RESTART=1", NULL });
-		schedule_delayed_work(&cr->lookup_work, 0);
+		queue_delayed_work(cr->wq, &cr->lookup_work, 0);
 	}
 	return true;
 }
@@ -947,7 +946,7 @@ static void aon_work_fn(struct work_struct *work)
 	if (cr->state == CAMRES_CONFIGURING) {
 		/* DEINIT in flight: resubscribe happens at INIT */
 		if (boot_phase)
-			schedule_delayed_work(&cr->aon_work,
+			queue_delayed_work(cr->wq, &cr->aon_work,
 					      msecs_to_jiffies(AON_RETRY_MS));
 		return;
 	}
@@ -961,7 +960,7 @@ static void aon_work_fn(struct work_struct *work)
 		 * DEINIT/INIT cycle re-subscribes).
 		 */
 		if (READ_ONCE(cr->state) == CAMRES_CONFIGURED)
-			schedule_delayed_work(&cr->aon_work,
+			queue_delayed_work(cr->wq, &cr->aon_work,
 					      msecs_to_jiffies(AON_RETRY_MS));
 		else
 			dev_info_ratelimited(cr->dev,
@@ -982,7 +981,7 @@ static void aon_work_fn(struct work_struct *work)
 			camres_boot_done(cr);
 			return;
 		}
-		schedule_delayed_work(&cr->aon_work,
+		queue_delayed_work(cr->wq, &cr->aon_work,
 				      msecs_to_jiffies(AON_RETRY_MS));
 		return;
 	}
@@ -1187,7 +1186,7 @@ static int release_locked(struct oplus_camres *cr)
 	 * power) is gone; re-arm it now that SEE owns the bus again.
 	 */
 	if (cr->registered && !cr->aon_armed)
-		schedule_delayed_work(&cr->aon_work, 0);
+		queue_delayed_work(cr->wq, &cr->aon_work, 0);
 	return 0;
 }
 
@@ -1206,7 +1205,7 @@ static void release_work_fn(struct work_struct *work)
 	if (cr->state == CAMRES_CONFIGURED && cr->ap_active &&
 	    !atomic_read(&cr->consumers)) {
 		if (release_locked(cr))
-			schedule_delayed_work(&cr->release_work,
+			queue_delayed_work(cr->wq, &cr->release_work,
 					      msecs_to_jiffies(200));
 	}
 	mutex_unlock(&cr->lock);
@@ -1299,7 +1298,7 @@ static void camres_release_vote(struct oplus_camres *cr)
 	if (atomic_dec_if_positive(&cr->consumers) == 0) {
 		/* a waiting DEINIT learns the last vote is gone */
 		wake_up_interruptible_all(&cr->state_wq);
-		mod_delayed_work(system_wq, &cr->release_work,
+		mod_delayed_work(cr->wq, &cr->release_work,
 				 msecs_to_jiffies(RELEASE_IDLE_MS));
 	}
 }
@@ -1380,12 +1379,12 @@ static int camres_bus_notify(struct notifier_block *nb, unsigned long action,
 		child->dev = dev;
 		/*
 		 * consumer first: the child's runtime-resume must run
-		 * the supplier (camres) resume first, and the link's
-		 * lifetime follows the child binding.
+		 * the supplier (camres) resume first.  No AUTOREMOVE —
+		 * a child unbind/rebind cycle would permanently drop
+		 * the PM chain (the notifier only fires ADD once).
 		 */
 		child->link = device_link_add(dev, cr->dev,
-					 DL_FLAG_PM_RUNTIME |
-				 DL_FLAG_AUTOREMOVE_CONSUMER);
+					 DL_FLAG_PM_RUNTIME);
 		list_add(&child->node, &cr->children);
 		break;
 	case BUS_NOTIFY_BIND_DRIVER:
@@ -1500,18 +1499,6 @@ static long camres_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		camres_release_vote(cr);
 		return 0;
 	case CAMRES_IOC_DEINIT:
-		/*
-		 * A DEINIT cycle overrides manual holds: they cannot be
-		 * dropped from sysfs once the state is UNCONFIGURED, so
-		 * leaving one standing would block this ioctl forever.
-		 */
-		mutex_lock(&cr->manual_lock);
-		if (cr->manual_ap) {
-			cr->manual_ap = false;
-			camres_release_vote(cr);
-		}
-		mutex_unlock(&cr->manual_lock);
-
 		mutex_lock(&cr->lock);
 		if (cr->state == CAMRES_CONFIGURING) {
 			ret = priv->owner && cr->deinit_done ? 1 : -EBUSY;
@@ -1527,16 +1514,14 @@ static long camres_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		mutex_unlock(&cr->lock);
 
 		/*
-		 * Block until the last AP user is done: explicit votes
-		 * (ioctls, kernel API, sysfs, probe windows) are counted
-		 * in ->consumers, device-link users in the runtime PM
-		 * usage of this device.  New acquires queue on the state
-		 * change instead of taking the bus.  Wakes come from the
-		 * vote-release path and the runtime-suspend completion.
+		 * Block until the last vote is gone.  The PM supplier
+		 * suspend drops its vote through camres_release_vote,
+		 * so consumers==0 covers every user — ioctls, kernel API,
+		 * probe windows, device links.  New acquires park on the
+		 * state change instead of taking the bus.
 		 */
 		ret = wait_event_interruptible(cr->state_wq,
-				atomic_read(&cr->consumers) == 0 &&
-				pm_runtime_suspended(cr->dev));
+				atomic_read(&cr->consumers) == 0);
 		if (ret) {
 			mutex_lock(&cr->lock);
 			if (cr->owner == priv &&
@@ -1610,7 +1595,7 @@ static long camres_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			dev_info(cr->dev, "SEE AON resubscribed\n");
 		} else if (!cr->aon_armed) {
 			dev_warn(cr->dev, "SEE AON resubscribe failed\n");
-			schedule_delayed_work(&cr->aon_work, 0);
+			queue_delayed_work(cr->wq, &cr->aon_work, 0);
 		}
 		wake_up_interruptible_all(&cr->state_wq);
 		return 0;
@@ -1635,64 +1620,7 @@ static ssize_t ap_hold_show(struct device *dev,
 {
 	return sysfs_emit(buf, "%d\n", oplus_camres_ap_holds());
 }
-
-static ssize_t ap_hold_store(struct device *dev,
-			     struct device_attribute *attr,
-			     const char *buf, size_t count)
-{
-	struct oplus_camres *cr = dev_get_drvdata(dev);
-	bool val;
-	int ret;
-
-	ret = kstrtobool(buf, &val);
-	if (ret)
-		return ret;
-
-	/* UNCONFIGURED never takes or drops manual votes */
-	if (READ_ONCE(cr->state) == CAMRES_UNCONFIGURED)
-		return -EOPNOTSUPP;
-
-	/*
-	 * manual_lock serializes the whole manual-vote lifecycle: the
-	 * acquire may park in a CONFIGURING wait, so cr->lock alone
-	 * cannot span it — without this a concurrent write-1 would
-	 * pass the manual_ap check before the parked one books it, and
-	 * a later write-0 could only release one of the two votes.
-	 */
-	mutex_lock(&cr->manual_lock);
-
-	if (val) {
-		if (!cr->manual_ap) {
-			ret = camres_acquire_vote(cr);
-			if (!ret) {
-				/*
-				 * A parked acquire may complete after the
-				 * state fell back to UNCONFIGURED (INIT
-				 * with an error); a manual vote is
-				 * unreleasable there, so drop it at once —
-				 * the next DEINIT cycle force-clears any
-				 * that slip through regardless.
-				 */
-				if (READ_ONCE(cr->state) == CAMRES_UNCONFIGURED) {
-					camres_release_vote(cr);
-					ret = -EOPNOTSUPP;
-				} else {
-					cr->manual_ap = true;
-				}
-			}
-		}
-	} else {
-		if (cr->manual_ap) {
-			cr->manual_ap = false;
-			camres_release_vote(cr);
-		}
-	}
-
-	mutex_unlock(&cr->manual_lock);
-	return ret ? ret : count;
-}
-static struct device_attribute dev_attr_ap_hold =
-	__ATTR(ap_hold, 0600, ap_hold_show, ap_hold_store);
+static DEVICE_ATTR_RO(ap_hold);
 
 static struct attribute *camres_attrs[] = {
 	&dev_attr_ap_hold.attr,
@@ -1712,54 +1640,27 @@ ATTRIBUTE_GROUPS(camres);
 static void camres_pm_recover(struct oplus_camres *cr)
 {
 	if (cr->dev->power.runtime_error)
-		pm_runtime_set_active(cr->dev);
+		pm_runtime_set_suspended(cr->dev);
 }
 
+/*
+ * The PM path is just another vote pair.  Resume propagates errors
+ * (the consumer must see the bus is unavailable); suspend always
+ * succeeds — the vote is already decremented, and a PM error here
+ * would poison the runtime PM state machine for no gain.  The actual
+ * bus handback runs asynchronously from release_work.
+ */
 static int camres_runtime_resume(struct device *dev)
 {
 	struct oplus_camres *cr = dev_get_drvdata(dev);
-	enum camres_state state = READ_ONCE(cr->state);
-	int ret;
 
-	/*
-	 * The runtime PM core increments the usage count of this device
-	 * BEFORE calling here (it must, to keep the supplier active
-	 * across the consumer's resume).  Queueing inside CONFIGURING
-	 * would therefore hold a usage reference while parked — and a
-	 * DEINIT waiting for pm_runtime_suspended() could never
-	 * complete, deadlocking against the userspace INIT that only
-	 * the DEINIT caller can issue.  So the runtime path fails fast
-	 * instead of queueing: the child's resume errors out, its
-	 * driver retries, and the ioctl/kernel-API acquire paths (which
-	 * queue first and count only afterwards) carry the queueing
-	 * semantics.
-	 */
-	if (state == CAMRES_CONFIGURING)
-		return -EAGAIN;
-	if (state == CAMRES_ERR)
-		return -EIO;
-
-	mutex_lock(&cr->lock);
-	ret = takeover_locked(cr, READ_ONCE(cr->state) == CAMRES_CONFIGURED);
-	mutex_unlock(&cr->lock);
-	return ret;
+	return camres_acquire_vote(cr);
 }
 
 static int camres_runtime_suspend(struct device *dev)
 {
-	struct oplus_camres *cr = dev_get_drvdata(dev);
-	int ret = 0;
-
-	mutex_lock(&cr->lock);
-	/* only the configured state hands an idle bus back to the SEE;
-	 * a DEINIT in progress forces its own handback after the wait */
-	if (cr->state == CAMRES_CONFIGURED && cr->ap_active)
-		ret = release_locked(cr);
-	mutex_unlock(&cr->lock);
-
-	/* the DEINIT waiter counts on this transition */
-	wake_up_interruptible_all(&cr->state_wq);
-	return ret;
+	camres_release_vote(dev_get_drvdata(dev));
+	return 0;
 }
 
 static const struct dev_pm_ops camres_pm_ops = {
@@ -1796,6 +1697,18 @@ static void camres_boot_done(struct oplus_camres *cr)
 		return;
 	}
 
+	/*
+	 * Runtime PM starts SUSPENDED, not active: pm_runtime_set_active()
+	 * would create an RPM_ACTIVE zombie (usage 0, no vote) that the
+	 * PM core's already-active short-circuit skips forever — the
+	 * resume callback (and the acquire_vote/park logic inside it)
+	 * would never fire.  The bus is held through ->ap_active and the
+	 * state gates; the PM status is the PM core's business.
+	 */
+	pm_runtime_enable(cr->dev);
+	pm_runtime_set_autosuspend_delay(cr->dev, RELEASE_IDLE_MS);
+	pm_runtime_use_autosuspend(cr->dev);
+
 	ret = bus_register_notifier(&i2c_bus_type, &cr->nb);
 	if (ret)
 		goto err_release;
@@ -1811,18 +1724,6 @@ static void camres_boot_done(struct oplus_camres *cr)
 	ret = misc_register(&cr->misc);
 	if (ret)
 		goto err_adapter;
-
-	/*
-	 * Runtime PM: autosuspend hands an idle CONFIGURED bus to the
-	 * SEE; in the other states the suspend callback is a no-op, so
-	 * no reference is pinned here — UNCONFIGURED and ERR keep the
-	 * bus through ->ap_active and the state gates alone, and the
-	 * DEINIT wait can observe "suspended" uniformly.
-	 */
-	pm_runtime_set_active(cr->dev);
-	pm_runtime_enable(cr->dev);
-	pm_runtime_set_autosuspend_delay(cr->dev, RELEASE_IDLE_MS);
-	pm_runtime_use_autosuspend(cr->dev);
 
 	camres_pm_recover(cr);
 	cr->boot_done = true;
@@ -1858,8 +1759,10 @@ static int oplus_camres_probe(struct platform_device *pdev)
 	cr->suid_hi = 0xa7167528f835f4eeULL;	/* camera_handshake */
 	cr->suid_lo = 0xe0e3f77b504b96a1ULL;
 	mutex_init(&cr->lock);
-	mutex_init(&cr->manual_lock);
 	atomic_set(&cr->consumers, 0);
+	cr->wq = alloc_workqueue("oplus-camres", WQ_UNBOUND, 0);
+	if (!cr->wq)
+		return -ENOMEM;
 	INIT_DELAYED_WORK(&cr->release_work, release_work_fn);
 	INIT_DELAYED_WORK(&cr->lookup_work, lookup_work_fn);
 	INIT_DELAYED_WORK(&cr->aon_work, aon_work_fn);
@@ -1915,7 +1818,7 @@ static int oplus_camres_probe(struct platform_device *pdev)
 	 * camres_boot_done() from aon_work_fn.  Nothing here blocks
 	 * probe; the camera subsystem appears asynchronously.
 	 */
-	schedule_delayed_work(&cr->lookup_work, 0);
+	queue_delayed_work(cr->wq, &cr->lookup_work, 0);
 
 	dev_info(dev, "camera bus manager starting (SEE boot chain)\n");
 	return 0;
@@ -1933,7 +1836,9 @@ static void oplus_camres_remove(struct platform_device *pdev)
 
 	if (!cr->boot_done) {
 		/* boot chain never settled: nothing was registered */
+		cancel_delayed_work_sync(&cr->aon_work);
 		sns_socket_close(cr);
+		destroy_workqueue(cr->wq);
 		of_node_put(cr->geni_np);
 		return;
 	}
@@ -1965,6 +1870,7 @@ static void oplus_camres_remove(struct platform_device *pdev)
 	mutex_unlock(&cr->lock);
 
 	sns_socket_close(cr);
+	destroy_workqueue(cr->wq);
 	of_node_put(cr->geni_np);
 }
 
