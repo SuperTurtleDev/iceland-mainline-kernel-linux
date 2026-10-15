@@ -124,7 +124,6 @@
 #define AON_RETRY_MS		1000
 #define AON_BOOT_TRIES		10
 #define LOOKUP_BOOT_TRIES	30	/* ~90s at LOOKUP_RETRY_MS */
-#define BOOT_RETRY_MS		5000
 #define RELEASE_IDLE_MS		2000
 
 #define CAMRES_ATTACH_NAME	"icelandmain"
@@ -329,7 +328,6 @@ struct oplus_camres {
 	u64 suid_lo;
 	struct delayed_work lookup_work;
 	struct delayed_work aon_work;
-	struct delayed_work boot_work;	/* retries camres_boot_done */
 };
 
 static struct oplus_camres *g_camres;
@@ -691,14 +689,6 @@ static int sns_xfer(struct oplus_camres *cr, u64 uid_lo, u64 uid_hi,
  * the SNS service ourselves.
  */
 static void camres_boot_done(struct oplus_camres *cr);
-
-static void boot_work_fn(struct work_struct *work)
-{
-	struct oplus_camres *cr = container_of(to_delayed_work(work),
-					       struct oplus_camres, boot_work);
-
-	camres_boot_done(cr);
-}
 
 static void lookup_work_fn(struct work_struct *work)
 {
@@ -1500,6 +1490,18 @@ static long camres_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		camres_release_vote(cr);
 		return 0;
 	case CAMRES_IOC_DEINIT:
+		/*
+		 * A DEINIT cycle overrides manual holds: they cannot be
+		 * dropped from sysfs once the state is UNCONFIGURED, so
+		 * leaving one standing would block this ioctl forever.
+		 */
+		mutex_lock(&cr->manual_lock);
+		if (cr->manual_ap) {
+			cr->manual_ap = false;
+			camres_release_vote(cr);
+		}
+		mutex_unlock(&cr->manual_lock);
+
 		mutex_lock(&cr->lock);
 		if (cr->state == CAMRES_CONFIGURING) {
 			ret = priv->owner && cr->deinit_done ? 1 : -EBUSY;
@@ -1634,6 +1636,10 @@ static ssize_t ap_hold_store(struct device *dev,
 	if (ret)
 		return ret;
 
+	/* UNCONFIGURED never takes or drops manual votes */
+	if (READ_ONCE(cr->state) == CAMRES_UNCONFIGURED)
+		return -EOPNOTSUPP;
+
 	/*
 	 * manual_lock serializes the whole manual-vote lifecycle: the
 	 * acquire may park in a CONFIGURING wait, so cr->lock alone
@@ -1646,22 +1652,27 @@ static ssize_t ap_hold_store(struct device *dev,
 	if (val) {
 		if (!cr->manual_ap) {
 			ret = camres_acquire_vote(cr);
-			if (!ret)
-				cr->manual_ap = true;
+			if (!ret) {
+				/*
+				 * A parked acquire may complete after the
+				 * state fell back to UNCONFIGURED (INIT
+				 * with an error); a manual vote is
+				 * unreleasable there, so drop it at once —
+				 * the next DEINIT cycle force-clears any
+				 * that slip through regardless.
+				 */
+				if (READ_ONCE(cr->state) == CAMRES_UNCONFIGURED) {
+					camres_release_vote(cr);
+					ret = -EOPNOTSUPP;
+				} else {
+					cr->manual_ap = true;
+				}
+			}
 		}
 	} else {
-		/*
-		 * Clearing a booked manual vote comes first, in every
-		 * state: a vote taken in UNCONFIGURED must be releasable
-		 * there too, otherwise it strands and blocks DEINIT
-		 * forever.  Dropping to the SEE is a different question —
-		 * that is what -EOPNOTSUPP guards.
-		 */
 		if (cr->manual_ap) {
 			cr->manual_ap = false;
 			camres_release_vote(cr);
-		} else if (READ_ONCE(cr->state) == CAMRES_UNCONFIGURED) {
-			ret = -EOPNOTSUPP;
 		}
 	}
 
@@ -1750,9 +1761,13 @@ static void camres_boot_done(struct oplus_camres *cr)
 	ret = takeover_locked(cr, false);
 	mutex_unlock(&cr->lock);
 	if (ret) {
+		/*
+		 * Fatal, by design: a takeover/registration failure here
+		 * is not something SEE rediscovery would cure — the only
+		 * sanctioned retry is a SEE restart, which re-runs this
+		 * path from the lookup chain.
+		 */
 		dev_err(cr->dev, "boot takeover failed (%d)\n", ret);
-		schedule_delayed_work(&cr->boot_work,
-				      msecs_to_jiffies(BOOT_RETRY_MS));
 		return;
 	}
 
@@ -1802,8 +1817,6 @@ err_release:
 		release_locked(cr);
 	mutex_unlock(&cr->lock);
 	dev_err(cr->dev, "boot bring-up failed (%d)\n", ret);
-	/* a failure here must not wedge the camera subsystem forever */
-	schedule_delayed_work(&cr->boot_work, msecs_to_jiffies(BOOT_RETRY_MS));
 }
 
 static int oplus_camres_probe(struct platform_device *pdev)
@@ -1824,7 +1837,6 @@ static int oplus_camres_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&cr->release_work, release_work_fn);
 	INIT_DELAYED_WORK(&cr->lookup_work, lookup_work_fn);
 	INIT_DELAYED_WORK(&cr->aon_work, aon_work_fn);
-	INIT_DELAYED_WORK(&cr->boot_work, boot_work_fn);
 	INIT_WORK(&cr->rx_work, rx_work_fn);
 	init_waitqueue_head(&cr->rx_wq);
 	init_waitqueue_head(&cr->state_wq);
@@ -1892,7 +1904,6 @@ static void oplus_camres_remove(struct platform_device *pdev)
 	cancel_delayed_work_sync(&cr->release_work);
 	cancel_delayed_work_sync(&cr->lookup_work);
 	cancel_delayed_work_sync(&cr->aon_work);
-	cancel_delayed_work_sync(&cr->boot_work);
 
 	if (!cr->boot_done) {
 		/* boot chain never settled: nothing was registered */
