@@ -1263,16 +1263,6 @@ static int camres_acquire_vote(struct oplus_camres *cr)
 	state = READ_ONCE(cr->state);
 	if (state == CAMRES_ERR)
 		return -EIO;
-	if (state == CAMRES_CONFIGURING) {
-		/*
-		 * A DEINIT cycle is in flight: park the thread (a real
-		 * sleep on state_wq — INIT or owner death wakes it)
-		 * until userspace resolves the state.
-		 */
-		if (wait_event_interruptible(cr->state_wq,
-				READ_ONCE(cr->state) != CAMRES_CONFIGURING))
-			return -EINTR;
-	}
 
 	mutex_lock(&cr->lock);
 	/*
@@ -1436,6 +1426,8 @@ static int camres_bus_notify(struct notifier_block *nb, unsigned long action,
 
 /* ---- /dev/camres ---- */
 
+static void camres_pm_recover(struct oplus_camres *cr);
+
 static int camres_open(struct inode *inode, struct file *file)
 {
 	struct camres_file *priv;
@@ -1573,6 +1565,7 @@ static long camres_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			dev_warn(cr->dev, "deinit: handback deferred\n");
 		sns_aon_power_off(cr);
 		cr->deinit_done = true;
+		camres_pm_recover(cr);
 		mutex_unlock(&cr->lock);
 		return 0;
 	case CAMRES_IOC_INIT: {
@@ -1602,6 +1595,7 @@ static long camres_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				 "INIT rejected (ack %d): staying unconfigured\n",
 				 ack);
 		}
+		camres_pm_recover(cr);
 		mutex_unlock(&cr->lock);
 
 		/*
@@ -1707,6 +1701,19 @@ static struct attribute *camres_attrs[] = {
 ATTRIBUTE_GROUPS(camres);
 
 /* ---- runtime PM (the supplier side of the child links) ---- */
+
+/*
+ * A runtime_resume that fails because of the state machine (ERR hard
+ * error, CONFIGURING fast-fail) leaves runtime_error set in the PM
+ * core, which silently kills every later supplier resume with
+ * -EINVAL.  The bus state machine is the authority here - not the PM
+ * core - so every transition into a usable state clears the poison.
+ */
+static void camres_pm_recover(struct oplus_camres *cr)
+{
+	if (cr->dev->power.runtime_error)
+		pm_runtime_set_active(cr->dev);
+}
 
 static int camres_runtime_resume(struct device *dev)
 {
@@ -1817,6 +1824,7 @@ static void camres_boot_done(struct oplus_camres *cr)
 	pm_runtime_set_autosuspend_delay(cr->dev, RELEASE_IDLE_MS);
 	pm_runtime_use_autosuspend(cr->dev);
 
+	camres_pm_recover(cr);
 	cr->boot_done = true;
 	g_camres = cr;
 	kobject_uevent_env(&cr->dev->kobj, KOBJ_CHANGE,
