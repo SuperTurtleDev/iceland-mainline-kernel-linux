@@ -1253,27 +1253,45 @@ static const struct i2c_algorithm camres_i2c_algo = {
  */
 static int camres_acquire_vote(struct oplus_camres *cr)
 {
+	enum camres_state state;
 	int ret;
 
 	if (!READ_ONCE(cr->boot_done))
 		return -EAGAIN;
 
-	mutex_lock(&cr->lock);
-	for (;;) {
-		enum camres_state state = READ_ONCE(cr->state);
+	/* entry verdicts, no lock needed */
+	state = READ_ONCE(cr->state);
+	if (state == CAMRES_ERR)
+		return -EIO;
+	if (state == CAMRES_CONFIGURING) {
+		/*
+		 * A DEINIT cycle is in flight: park the thread (a real
+		 * sleep on state_wq — INIT or owner death wakes it)
+		 * until userspace resolves the state.
+		 */
+		if (wait_event_interruptible(cr->state_wq,
+				READ_ONCE(cr->state) != CAMRES_CONFIGURING))
+			return -EINTR;
+	}
 
-		if (state == CAMRES_ERR) {
-			mutex_unlock(&cr->lock);
-			return -EIO;
-		}
-		if (state != CAMRES_CONFIGURING)
-			break;
+	mutex_lock(&cr->lock);
+	/*
+	 * Rare race: another DEINIT re-entered CONFIGURING between the
+	 * wake and this lock — re-park.  Without this re-validation a
+	 * takeover could slip into the DEINIT wait window and count
+	 * its vote only after the handback, stranding it.
+	 */
+	while (READ_ONCE(cr->state) == CAMRES_CONFIGURING) {
 		mutex_unlock(&cr->lock);
 		if (wait_event_interruptible(cr->state_wq,
-					     READ_ONCE(cr->state) !=
-					     CAMRES_CONFIGURING))
+				READ_ONCE(cr->state) != CAMRES_CONFIGURING)) {
 			return -EINTR;
+		}
 		mutex_lock(&cr->lock);
+	}
+	if (READ_ONCE(cr->state) == CAMRES_ERR) {
+		mutex_unlock(&cr->lock);
+		return -EIO;
 	}
 
 	ret = takeover_locked(cr, READ_ONCE(cr->state) == CAMRES_CONFIGURED);
