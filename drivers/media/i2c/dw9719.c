@@ -8,8 +8,10 @@
  * from: https://github.com/MiCode/Xiaomi_Kernel_OpenSource/
  */
 
+#include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/i2c.h>
+#include <linux/iopoll.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 #include <linux/types.h>
@@ -46,14 +48,38 @@
 #define DW9719_ID			0xF1
 #define DW9761_ID			0xF4
 /*
- * DW9714V in its register-mapped ("advanced") mode: IC INFO reads
- * manufacturer 0xF / model 0xE and the CONTROL/VCM/STATUS/MODE/FREQ
- * registers sit at the DW9719 offsets.
+ * DW9714V in its register-mapped ("advanced") mode.  The part is a
+ * DW9714 successor which powers up either in the DW9714-compatible
+ * normal mode (bare 16-bit data writes, no registers) or already
+ * register-mapped, depending on the module.  In advanced mode it shares
+ * the INFO/CONTROL/VCM_CURRENT/STATUS/VCM_FREQ offsets with the DW9719
+ * (datasheet Rev 0.03G, table 23), the SAC configuration register
+ * differs.
  */
 #define DW9714V_ID			0xFE
-/* vendor init for the OnePlus Pad 4 module: MODE 0x80, FREQ 0x79 */
-#define DW9714V_DEFAULT_SAC		2
-#define DW9714V_DEFAULT_VCM_FREQ	0x79
+
+#define DW9714V_SAC_CFG			CCI_REG8(6)
+#define DW9714V_SAC_CFG_RING_EN		BIT(7)
+#define DW9714V_SAC_CFG_SAC_MODE_MASK	GENMASK(3, 0)
+/* SAC_MODE field values, table 31 */
+#define DW9714V_SAC2			0x0
+#define DW9714V_SAC3			0x1
+#define DW9714V_SAC4			0x3
+#define DW9714V_DEFAULT_VCM_FREQ	0x60
+
+/*
+ * Escape sequence taking a normal-mode DW9714V into the register-mapped
+ * mode: a bare two-byte write of 0xed 0xab, which is exactly what a CCI
+ * write of register 0xed with value 0xab puts on the wire.
+ */
+#define DW9714V_ENTER_ADVANCED_MODE	CCI_REG8(0xed)
+
+/* rail settle after power on and PD-to-ready wait, tOPR >= 1 ms */
+#define DW9714V_POWER_ON_DELAY_US_MIN	12000
+#define DW9714V_POWER_ON_DELAY_US_MAX	14000
+#define DW9714V_T_OPR_US		1000
+#define DW9714V_BUSY_POLL_US		1000
+#define DW9714V_BUSY_TIMEOUT_US		100000
 
 #define DW9719_CONTROL			CCI_REG8(2)
 #define DW9719_STANDBY			0x00
@@ -100,6 +126,7 @@ struct dw9719_device {
 	u32 mode_low_bits;
 	u32 sac_mode;
 	u32 vcm_freq;
+	bool sac_ring_enable;
 
 	struct dw9719_v4l2_ctrls {
 		struct v4l2_ctrl_handler handler;
@@ -120,12 +147,181 @@ static int dw9719_power_down(struct dw9719_device *dw9719)
 	return regulator_disable(dw9719->regulator);
 }
 
+static void dw9714v_read_properties(struct dw9719_device *dw9719)
+{
+	struct device *dev = dw9719->dev;
+
+	/*
+	 * dongwoon,sac-mode keeps the family encoding; the DW9714V
+	 * implements SAC2/SAC3/SAC4.  Without dongwoon,sac-ring-enable the
+	 * part drives the DAC directly and works like a DW9714.
+	 */
+	dw9719->sac_mode = DW9719_DEFAULT_SAC;
+	device_property_read_u32(dev, "dongwoon,sac-mode", &dw9719->sac_mode);
+	dw9719->sac_ring_enable =
+		device_property_present(dev, "dongwoon,sac-ring-enable");
+	if (dw9719->sac_ring_enable &&
+	    (dw9719->sac_mode < 3 || dw9719->sac_mode > 5))
+		dev_warn(dev, "sac-mode %u not supported by the DW9714V, using SAC3\n",
+			 dw9719->sac_mode);
+
+	dw9719->vcm_freq = DW9714V_DEFAULT_VCM_FREQ;
+	device_property_read_u32(dev, "dongwoon,vcm-prescale",
+				 &dw9719->vcm_freq);
+}
+
+static u32 dw9714v_sac_mode_field(u32 sac_mode)
+{
+	switch (sac_mode) {
+	case 3:
+		return DW9714V_SAC2;
+	case 5:
+		return DW9714V_SAC4;
+	case 4:
+	default:
+		return DW9714V_SAC3;
+	}
+}
+
+static int dw9714v_enter_advanced_mode(struct dw9719_device *dw9719)
+{
+	u64 val;
+	int ret;
+
+	ret = cci_read(dw9719->regmap, DW9719_INFO, &val, NULL);
+	if (!ret && val == DW9714V_ID)
+		return 0;
+
+	/*
+	 * The part is in the DW9714-compatible normal mode, where a
+	 * register write would be taken as VCM data: send the documented
+	 * bare 0xed 0xab entry sequence and expect IC INFO to answer.
+	 */
+	ret = cci_write(dw9719->regmap, DW9714V_ENTER_ADVANCED_MODE, 0xab, NULL);
+	if (ret)
+		return ret;
+
+	fsleep(DW9714V_T_OPR_US);
+
+	ret = cci_read(dw9719->regmap, DW9719_INFO, &val, NULL);
+	if (ret)
+		return ret;
+	if (val != DW9714V_ID) {
+		dev_err(dw9719->dev, "unexpected IC info 0x%02llx\n", val);
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+static int dw9714v_read_busy(struct dw9719_device *dw9719)
+{
+	u64 val;
+	int ret;
+
+	ret = cci_read(dw9719->regmap, DW9719_STATUS, &val, NULL);
+	if (ret)
+		return ret;
+
+	return !!(val & DW9719_STATUS_BUSY);
+}
+
+/*
+ * While BUSY the chip ACKs but silently drops every command except PD
+ * (datasheet table 28).  A lost configuration write would leave the
+ * ringing control misconfigured without any error, so wait for idle once
+ * before the configuration writes; position writes later on are left
+ * unchecked on purpose, the focus loop issues new targets continuously
+ * anyway.
+ */
+static int dw9714v_wait_idle(struct dw9719_device *dw9719)
+{
+	int busy;
+	int ret;
+
+	ret = readx_poll_timeout(dw9714v_read_busy, dw9719, busy, busy <= 0,
+				 DW9714V_BUSY_POLL_US, DW9714V_BUSY_TIMEOUT_US);
+	if (ret)
+		return ret;
+	if (busy < 0)
+		return busy;
+
+	return 0;
+}
+
+static int dw9714v_power_up(struct dw9719_device *dw9719)
+{
+	u32 sac_cfg = 0;
+	int ret;
+
+	ret = regulator_enable(dw9719->regulator);
+	if (ret)
+		return ret;
+
+	usleep_range(DW9714V_POWER_ON_DELAY_US_MIN,
+		     DW9714V_POWER_ON_DELAY_US_MAX);
+
+	/*
+	 * Run on every power cycle, not just probe: whether the advanced
+	 * mode survives a power cycle is revision dependent.
+	 */
+	ret = dw9714v_enter_advanced_mode(dw9719);
+	if (ret)
+		goto err_power_down;
+
+	/*
+	 * PD '1' then '0' as the datasheet power sequence requires; PD
+	 * works even while BUSY and aborts a move still in flight on a
+	 * rail that never dropped.
+	 */
+	ret = cci_write(dw9719->regmap, DW9719_CONTROL, DW9719_SHUTDOWN, NULL);
+	if (ret)
+		goto err_power_down;
+
+	ret = cci_write(dw9719->regmap, DW9719_CONTROL, DW9719_STANDBY, NULL);
+	if (ret)
+		goto err_power_down;
+
+	fsleep(DW9714V_T_OPR_US);
+
+	ret = dw9714v_wait_idle(dw9719);
+	if (ret)
+		goto err_power_down;
+
+	if (dw9719->sac_ring_enable)
+		sac_cfg = DW9714V_SAC_CFG_RING_EN |
+			  FIELD_PREP(DW9714V_SAC_CFG_SAC_MODE_MASK,
+				     dw9714v_sac_mode_field(dw9719->sac_mode));
+
+	/*
+	 * CONTROL bit 1 is undocumented for this part but is the ringing
+	 * enable of the rest of the family and is required here as well:
+	 * with it clear and RING_EN set, every move leaves BUSY stuck.
+	 * VCM_FREQ has the DW9719 layout (period divider in [7:6], period
+	 * in [5:0]), not the two-bit prescaler the datasheet lists.
+	 */
+	cci_write(dw9719->regmap, DW9719_CONTROL, DW9719_ENABLE_RINGING, &ret);
+	cci_write(dw9719->regmap, DW9714V_SAC_CFG, sac_cfg, &ret);
+	cci_write(dw9719->regmap, DW9719_VCM_FREQ, dw9719->vcm_freq, &ret);
+	if (ret)
+		goto err_power_down;
+
+	return 0;
+
+err_power_down:
+	dw9719_power_down(dw9719);
+	return ret;
+}
+
 static int dw9719_power_up(struct dw9719_device *dw9719, bool detect)
 {
 	u32 reg_pwr = dw9719->model == DW9718S ? DW9718S_PD : DW9719_CONTROL;
 	u64 val;
 	int ret;
 	int err;
+
+	if (dw9719->model == DW9714V)
+		return dw9714v_power_up(dw9719);
 
 	ret = regulator_enable(dw9719->regulator);
 	if (ret)
@@ -163,11 +359,6 @@ static int dw9719_power_up(struct dw9719_device *dw9719, bool detect)
 			return ret;
 
 		switch (val) {
-		case DW9714V_ID:
-			dw9719->model = DW9714V;
-			dw9719->sac_mode = DW9714V_DEFAULT_SAC;
-			dw9719->vcm_freq = DW9714V_DEFAULT_VCM_FREQ;
-			break;
 		case DW9719_ID:
 			dw9719->model = DW9719;
 			dw9719->mode_low_bits = 0x00;
@@ -203,7 +394,6 @@ props:
 	}
 
 	switch (dw9719->model) {
-	case DW9714V:
 	case DW9800K:
 		cci_write(dw9719->regmap, DW9719_CONTROL, DW9719_ENABLE_RINGING, &ret);
 		cci_write(dw9719->regmap, DW9719_MODE,
@@ -232,6 +422,9 @@ props:
 		cci_write(dw9719->regmap, DW9719_MODE, dw9719->mode_low_bits |
 				  (dw9719->sac_mode << DW9719_MODE_SAC_SHIFT), &ret);
 		cci_write(dw9719->regmap, DW9719_VCM_FREQ, dw9719->vcm_freq, &ret);
+		break;
+	default:
+		break;
 	}
 
 	if (ret)
@@ -382,6 +575,9 @@ static int dw9719_probe(struct i2c_client *client)
 		return PTR_ERR(dw9719->regmap);
 
 	dw9719->dev = &client->dev;
+
+	if (dw9719->model == DW9714V)
+		dw9714v_read_properties(dw9719);
 
 	dw9719->regulator = devm_regulator_get(&client->dev, "vdd");
 	if (IS_ERR(dw9719->regulator))
