@@ -10,12 +10,14 @@ maintainers:
   - André Apitzsch <git@apitzsch.eu>
 
 description:
-  The Dongwoon DW9718S/9719/9761 is a single 10-bit digital-to-analog converter
-  with 100 mA output current sink capability, designed for linear control of
-  voice coil motors (VCM) in camera lenses. This chip provides a Smart Actuator
-  Control (SAC) mode intended for driving voice coil lenses in camera modules.
-  The DW9714V exposes the same register layout in its register-mapped
-  ("advanced") mode.
+  The Dongwoon DW9718S/9719/9761/9800K are single 10-bit digital-to-analog
+  converters with 100 mA output current sink capability, designed for linear
+  control of voice coil motors (VCM) in camera lenses. These chips provide a
+  Smart Actuator Control (SAC) mode intended for driving voice coil lenses
+  in camera modules. The DW9714V is a DW9714 successor which additionally
+  provides a register-mapped ("advanced") mode with the DW9719 register
+  layout and SAC2/SAC3/SAC4 ringing control, entered by an I2C command
+  sequence.
 
 properties:
   compatible:
@@ -53,6 +55,13 @@ properties:
       Indication of VCM switching frequency dividing rate select.
     $ref: /schemas/types.yaml#/definitions/uint32
 
+  dongwoon,sac-ring-enable:
+    description:
+      Enable the ringing control block (SAC_CFG RING_EN). When absent, the
+      DAC is driven directly (DW9714-compatible behavior) and
+      dongwoon,sac-mode has no effect.
+    type: boolean
+
 required:
   - compatible
   - reg
@@ -72,6 +81,29 @@ allOf:
           maximum: 15
           default: 0
 
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: dongwoon,dw9714v
+    then:
+      properties:
+        dongwoon,sac-mode:
+          description:
+            SAC2, SAC3 or SAC4 ringing control mode.
+          enum: [3, 4, 5]
+        dongwoon,vcm-prescale:
+          description:
+            Value of the VCM_FREQ register. Bits 7:6 select the ringing
+            control period divider (2, 1, 1/2, 1/4), bits 5:0 the period,
+            which has to match the mechanical vibration period (tVIB) of
+            the actuator and lens assembly of the camera module.
+          maximum: 255
+          default: 0x60
+    else:
+      properties:
+        dongwoon,sac-ring-enable: false
+
 additionalProperties: false
 
 examples:
@@ -88,5 +120,22 @@ examples:
 
             dongwoon,sac-mode = <4>;
             dongwoon,vcm-prescale = <0>;
+        };
+    };
+
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        actuator@c {
+            compatible = "dongwoon,dw9714v";
+            reg = <0x0c>;
+
+            vdd-supply = <&vreg_l16b_2p8>;
+
+            dongwoon,sac-ring-enable;
+            dongwoon,sac-mode = <3>;
+            dongwoon,vcm-prescale = <0x79>;
         };
     };
