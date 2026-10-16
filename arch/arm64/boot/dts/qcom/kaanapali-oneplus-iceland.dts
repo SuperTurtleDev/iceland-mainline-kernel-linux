@@ -1097,6 +1097,8 @@
 		dovdd-supply = <&vreg_l2f_1p8>;
 		afvdd-supply = <&vreg_l16b_2p8>;
 
+		lens-focus = <&camera_rear_vcm>;
+
 		flash-leds = <&pmh0101_flash_led0>;
 
 		port {
@@ -1110,16 +1112,20 @@
 	};
 
 	/*
-	 * Rear AF actuator, Dongwoon DW9714V (IC INFO 0xfe). On this board
-	 * it powers up in its register-mapped mode, served by the dw9719
-	 * driver. Vendor 8-bit address 0x18.
+	 * Rear AF actuator, Dongwoon DW9714V (IC INFO 0xfe), vendor 8-bit
+	 * address 0x18. Ringing control tuning from the vendor actuator init:
+	 * RING_EN + SAC2, VCM_FREQ 0x79.
 	 */
-		camera_rear_vcm: camera-lens@c {
-			compatible = "dongwoon,dw9714v";
-			reg = <0x0c>;
+	camera_rear_vcm: camera-lens@c {
+		compatible = "dongwoon,dw9714v";
+		reg = <0x0c>;
 
-			vdd-supply = <&vreg_l16b_2p8>;
-		};
+		vdd-supply = <&vreg_l16b_2p8>;
+
+		dongwoon,sac-ring-enable;
+		dongwoon,sac-mode = <3>;
+		dongwoon,vcm-prescale = <0x79>;
+	};
 
 	/* Front 8MP, SmartSens SC820CS */
 	camera_front: camera@10 {
