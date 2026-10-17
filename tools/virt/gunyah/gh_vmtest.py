@@ -56,8 +56,11 @@ class FDT:
         return struct.pack(">IIIIIIIIII", 0xd00dfeed, total, st, strs, rsv, 17, 16, 0,
                            len(self.strings), len(self.struct)) + b"\0" * 16 + bytes(self.struct) + bytes(self.strings)
 
-def build_dtb(ram_base, ram_size, gicd, gicr, shared=None, variant="none"):
-    """shared = (gpa, size, label) of an extra SHARE binding, declared per variant"""
+def build_dtb(ram_base, ram_size, gicd, gicr, shared=None, variant="none", rm_rpc=False):
+    """shared = (gpa, size, label) of an extra SHARE binding, declared per variant
+    rm_rpc: ask the RM for an RM-RPC message queue pair (vdevice-type "rm-rpc"); the RM then
+    generates /hypervisor/qcom,resource-mgr with compatible "gunyah-resource-manager" and
+    reg = <tx_capid rx_capid>, which is what a guest needs to issue MEM_ACCEPT itself"""
     f = FDT()
     f.begin("")
     f.u32("#address-cells", 2); f.u32("#size-cells", 2)
@@ -71,6 +74,9 @@ def build_dtb(ram_base, ram_size, gicd, gicr, shared=None, variant="none"):
     if shared and variant == "vmmio":
         f.u64("vmmio-ranges", shared[0], shared[1])
     f.begin("vdevices"); f.s("generate", "/hypervisor")
+    if rm_rpc:
+        f.begin("rm-rpc"); f.s("vdevice-type", "rm-rpc"); f.s("generate", "/hypervisor/qcom,resource-mgr")
+        f.prop("console-dev"); f.u32("message-size", 0xf0); f.u32("queue-depth", 8); f.u32("qcom,label", 1); f.end()
     if shared and variant == "shm":
         f.begin("shm-0"); f.s("vdevice-type", "shm"); f.prop("peer-default"); f.u64("dma_base", 0)
         f.begin("memory"); f.prop("optional"); f.u32("label", shared[2]); f.u32("#address-cells", 2); f.u64("base", shared[0]); f.end()

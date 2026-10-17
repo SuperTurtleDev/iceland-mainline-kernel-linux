@@ -74,8 +74,8 @@ The RM validates the VMM-supplied DTB at VM_INIT and answers
      protected VM.
   Shared memory for a protected guest is therefore GuestAccept only: the
   host shares an RM memparcel and the guest accepts it by handle into its
-  own stage-2. That is provided by an out-of-tree module (the gunyah_share
-  model), not by this tree.
+  own stage-2. This tree provides that on the VM fd, see "Runtime protected
+  share" below.
 - The RM log (`/sys/hypervisor/rm_log`) is unimplemented (RM error -1).
 - Never fork() a VMM process that holds lent guest RAM. The lent pages are
   pinned (FOLL_LONGTERM), so dup_mmap() copies them eagerly instead of
@@ -85,3 +85,94 @@ The RM validates the VMM-supplied DTB at VM_INIT and answers
   acct_collect). Observed once on the Pad 4. Multi-process VMMs must pass
   guest memory as shared memfd/dma-buf mappings, as crosvm does.
 - QTVM (authenticated) launch needs a signed image and a PAS ID; untested.
+
+## Runtime protected share (GuestAccept)
+
+Mainline addition, not in the Android source: `drivers/virt/gunyah/vm_mgr_pshare.c`.
+It is the in-tree form of DroidVM's out-of-tree `gunyah_share_mod` (which had
+to add its own `/dev/gunyah_share` and resolve RM helpers via kallsyms because
+the GKI driver could not be patched). Here the ioctls sit on the VM fd itself
+and call `gunyah_rm_mem_share()` / `gunyah_rm_mem_reclaim()` directly.
+
+| ioctl (VM fd) | Direction | Effect |
+|---|---|---|
+| `GH_VM_PROTECTED_SHARE` | `struct gunyah_protected_share`, in/out | Pin a page-aligned userspace buffer (`FOLL_LONGTERM`), SHARE it as one RM memparcel (ACL: guest with the requested RWX subset, host RWX), return `mem_handle`. Physically contiguous runs are merged into one mem entry. |
+| `GH_VM_PROTECTED_SHARE_DMABUF` | `struct gunyah_protected_share_dmabuf`, in/out | Same for a page-aligned slice of a DMA-BUF: the attachment pins the exporter's backing, the parcel is sliced from its sg-table. For VM_PFNMAP exporters GUP cannot pin. |
+| `GH_VM_PROTECTED_UNSHARE` | `struct gunyah_protected_unshare`, in | Reclaim the parcel by label and unpin. The RM refuses (`MEM_INUSE`, surfaced as `-EBUSY`) while the guest still holds its acceptance; the share then stays pinned. Pages go back to the allocator only after a successful reclaim. |
+| `GH_VM_CHECK_EXTENSION` with `GH_CAP_PROTECTED_SHARE` | | Returns 1 when the three ioctls exist. |
+
+Rules the caller must follow:
+
+- Only the VM owner task (the mm that created the VM) may share or unshare,
+  like the other memory ioctls.
+- The VM must have been started (RM state LOAD/READY/RUNNING/PAUSED); the
+  guest VMID is part of the ACL. Before `GUNYAH_VM_START` the call fails with
+  `-ENXIO`.
+- Labels are unique per VM among protected shares (`-EEXIST`). Towards the RM
+  the label carries bit 31 so it cannot collide with a userspace-region label.
+- `guest_phys_addr` is informational: the guest picks its IPA when it accepts.
+- Nothing is mapped until the guest accepts. The guest side is the DroidVM
+  guest additions' `gunyah_guest.ko`: RM `MEM_ACCEPT` by handle with
+  `MAP_IPA_CONTIGUOUS`, one sgl `{gpa, memory_size}`, `validate_label = 0`;
+  the parcel's total size equals `memory_size`, which that accept form
+  requires.
+- Order on teardown: guest `MEM_RELEASE`, then host `GH_VM_PROTECTED_UNSHARE`.
+  The host never decides on its own that the guest is done: the RM tracks the
+  acceptance, and `-EBUSY` from UNSHARE means "guest has not released, retry
+  later". (`gunyah_rm_error_remap()` maps `MEM_INUSE` to `-EBUSY` for this;
+  the Android source mapped it to `-EINVAL`.)
+- `tools/virt/gunyah/gh_sharetest.py` exercises the host side against the
+  PSCI_OFF stub guest (no accept): validation, handles, labels, locked_vm
+  accounting, the udmabuf path and reclaim at fd close.
+- `tools/virt/gunyah/gh_accepttest.py` is the end-to-end test with a guest
+  that really accepts. The guest is `gh_rmproxy.S` (244 bytes, bare metal,
+  MMU off): a command loop driven through MMIO exits (dump/load memory, msgq
+  send/recv, power off). The host dumps the RM-overlaid DTB to find the RM
+  msgq capability ids, frames MEM_ACCEPT / MEM_RELEASE itself and verifies:
+  accept at a guest-chosen IPA, host->guest and guest->host visibility
+  through the buffer, UNSHARE while accepted -> `-EBUSY` with pages still
+  pinned, UNSHARE after MEM_RELEASE -> success, the same sequence for a
+  udmabuf-backed `GH_VM_PROTECTED_SHARE_DMABUF` (whole buffer and a sliced
+  re-share at an offset), and three still-accepted shares reclaimed at fd
+  close with locked_vm back to zero. Verified on the Pad 4.
+  Build the stub with the command in its header; the test loads
+  `gh_rmproxy.bin` from its own directory.
+
+### Guest DTB requirement for a self-accepting guest
+
+The RM only gives a VM an RM-RPC message queue pair when the VM config asks
+for one. Without it the overlay adds just `/hypervisor/qcom,gunyah-vm`, and the
+guest has no channel for MEM_ACCEPT. `gh_vmtest.build_dtb(rm_rpc=True)` adds:
+
+```
+vdevices {
+	generate = "/hypervisor";
+	rm-rpc {
+		vdevice-type = "rm-rpc";
+		generate = "/hypervisor/qcom,resource-mgr";
+		console-dev;
+		message-size = <0xf0>;
+		queue-depth = <8>;
+		qcom,label = <1>;
+	};
+};
+```
+
+The RM appends `gunyah-resource-manager`, `qcom,resource-manager` and
+`qcom,resource-manager-<api>` to the generated node's compatible list itself
+(`parse_rm_rpc()` in the RM's `vm_config_parser.c`), and sets
+`reg = <tx_capid rx_capid>` as two 64-bit cells. That is the node both the
+in-tree `gunyah_rsc_mgr` (as a guest) and the DroidVM guest additions look for.
+
+Two guest-side details that cost debugging time: with the MMU off, bracket
+shared-buffer accesses with `dc civac` (clean before loads so the host's dirty
+lines reach memory; clean+invalidate around stores so no dirty host line is
+written back over them), and remember that a guest resumes from an MMIO read
+exit only on the next `GUNYAH_VCPU_RUN`, so the host must round-trip once more
+before it may expect the guest's subsequent stores to have happened.
+  Shares still live when the VM fd is closed are reclaimed after the RM has
+  reset the VM (the reset drops the guest's acceptances). A parcel the RM
+  still refuses to return is leaked, never freed: the hypervisor may still map it.
+
+The RM misc device gets a 64-bit DMA mask at probe so it can serve as the
+DMA-BUF importer device.
