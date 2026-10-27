@@ -37,7 +37,7 @@ static const struct bw_info iris_bw_table_dec_vpu4x[] = {
 static const char * const iris_opp_pd_table_vpu4x[] = { "mxc", "mmcx" };
 
 const struct iris_platform_data kaanapali_data = {
-	.firmware_desc = &iris_vpu40_p2_s7_gen2_desc,
+	.firmware_desc_gen2 = &iris_vpu40_p2_s7_gen2_desc,
 	.vpu_ops = &iris_vpu4x_ops,
 	.icc_tbl = iris_icc_info_vpu4x,
 	.icc_tbl_size = ARRAY_SIZE(iris_icc_info_vpu4x),
