@@ -386,6 +386,7 @@ static void camres_data_ready(struct sock *sk);
 static int sns_socket_open(struct oplus_camres *cr)
 {
 	struct sock *sk;
+	unsigned long flags;
 	int ret;
 
 	if (cr->sock)
@@ -400,26 +401,27 @@ static int sns_socket_open(struct oplus_camres *cr)
 
 	/* event-driven receive, as net/qrtr/ns.c does for its socket */
 	sk = cr->sock->sk;
-	write_lock_bh(&sk->sk_callback_lock);
+	write_lock_irqsave(&sk->sk_callback_lock, flags);
 	sk->sk_user_data = cr;
 	cr->saved_data_ready = sk->sk_data_ready;
 	sk->sk_data_ready = camres_data_ready;
-	write_unlock_bh(&sk->sk_callback_lock);
+	write_unlock_irqrestore(&sk->sk_callback_lock, flags);
 	return 0;
 }
 
 static void sns_socket_close(struct oplus_camres *cr)
 {
 	struct sock *sk;
+	unsigned long flags;
 
 	if (!cr->sock)
 		return;
 
 	sk = cr->sock->sk;
-	write_lock_bh(&sk->sk_callback_lock);
+	write_lock_irqsave(&sk->sk_callback_lock, flags);
 	sk->sk_data_ready = cr->saved_data_ready;
 	sk->sk_user_data = NULL;
-	write_unlock_bh(&sk->sk_callback_lock);
+	write_unlock_irqrestore(&sk->sk_callback_lock, flags);
 
 	cancel_work_sync(&cr->rx_work);
 	sock_release(cr->sock);
@@ -569,16 +571,17 @@ static int sns_parse_ack(const u8 *buf, size_t len, u64 uid_lo, u64 uid_hi,
 	return 0;
 }
 
-/* softirq context: just kick the drain work */
+/* QRTR may call this from a GLINK hard IRQ: just kick the drain work. */
 static void camres_data_ready(struct sock *sk)
 {
 	struct oplus_camres *cr;
+	unsigned long flags;
 
-	read_lock_bh(&sk->sk_callback_lock);
+	read_lock_irqsave(&sk->sk_callback_lock, flags);
 	cr = sk->sk_user_data;
 	if (cr)
 		schedule_work(&cr->rx_work);
-	read_unlock_bh(&sk->sk_callback_lock);
+	read_unlock_irqrestore(&sk->sk_callback_lock, flags);
 }
 
 /* a data-plane datagram: complete the armed transaction if it matches */
