@@ -1080,6 +1080,7 @@
 	camera_rear: camera@36 {
 		compatible = "smartsens,sc1300cs";
 		reg = <0x36>;
+		post-init-providers = <&camss>;
 
 		orientation = <1>;
 
@@ -1130,6 +1131,7 @@
 	camera_front: camera@10 {
 		compatible = "smartsens,sc820cs";
 		reg = <0x10>;
+		post-init-providers = <&camss>;
 
 		orientation = <0>;
 
