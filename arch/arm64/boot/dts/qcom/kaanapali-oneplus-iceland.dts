@@ -40,6 +40,11 @@
 
 	chosen { };
 
+	charger_pps: charger-pps {
+		compatible = "oplus,iceland-pmic-pps";
+		oplus,pmic-glink = <&pmic_glink>;
+	};
+
 	/* Both produced by Master KTZ8869, unfortunately gpio 14 and 15 aren't
 	 * wired to Master KTZ8869 in MP units, so vddpos and vddneg will always be active
 	 * unless KTZ8869 driver gets implemented as regulator.
@@ -114,7 +119,7 @@
 		};
 	};
 
-	pmic-glink {
+	pmic_glink: pmic-glink {
 		compatible = "oplus,kaanapali-pmic-glink", "qcom,kaanapali-pmic-glink";
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -1065,6 +1070,8 @@
  */
 &oplus_camres {
 	compatible = "oplus,camres";
+	#address-cells = <1>;
+	#size-cells = <0>;
 	i2c-bus = <&i2c9>;
 
 	/* camera_handshake SUID (SEE SUID registry) */
@@ -1272,6 +1279,10 @@
 };
 
 &mdss_dsi1 {
+	/* The secondary controller has no directly attached panel device. */
+	/delete-property/ #address-cells;
+	/delete-property/ #size-cells;
+
 	vdda-supply = <&vreg_l1d_1p2>;
 	qcom,dual-dsi-mode;
 	qcom,sync-dual-dsi;
@@ -1795,3 +1806,5 @@
 
 	status = "okay";
 };
+
+#include "kaanapali-oneplus-iceland-pps.dtsi"
