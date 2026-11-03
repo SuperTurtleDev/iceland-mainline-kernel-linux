@@ -1184,11 +1184,12 @@ int qcom_battmgr_pps_request(struct power_supply *usb,
 			return ret;
 		if (battmgr->pps_value != 8)
 			return -EOPNOTSUPP;
+		/* Match the vendor sequence: request voltage before current. */
 		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
-						  30, values[1]);
+						  29, values[0]);
 		if (!ret)
 			ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
-							  29, values[0]);
+							  30, values[1]);
 		if (!ret)
 			ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
 							  USB_INPUT_CURR_LIMIT, values[1] * 1000);

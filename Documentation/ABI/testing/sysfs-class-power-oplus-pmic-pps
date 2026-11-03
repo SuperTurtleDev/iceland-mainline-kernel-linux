@@ -27,7 +27,9 @@ Description:
                 restores basic charging, not charge inhibition; online=2
                 enables automatic PPS. PPS stops on an invalid measurement,
                 curve exhaustion or communication failure. Faults are latched
-                until unplug or an explicit online write. When block_suspend=0,
+                until unplug or an explicit online write. If no curve covers
+                the current SOC/temperature, basic charging continues until
+                a supply event makes a curve eligible. When block_suspend=0,
                 suspend restores basic charging before device suspend, then
                 resumes event-driven PPS on PM_POST_SUSPEND. No userspace
                 daemon is required.

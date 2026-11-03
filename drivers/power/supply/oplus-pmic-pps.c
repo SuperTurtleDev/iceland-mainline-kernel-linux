@@ -320,6 +320,8 @@ static void pps_work(struct work_struct *work)
 		if (ret)
 			goto fail;
 		ret = pps_begin_curve(p, now);
+		if (ret == -ENOENT)
+			goto out;
 		if (ret)
 			goto fail;
 		ret = pps_read(p->usb, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &native_icl);
