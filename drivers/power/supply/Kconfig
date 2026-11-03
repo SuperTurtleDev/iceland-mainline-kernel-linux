@@ -1202,4 +1202,14 @@ config MACSMC_POWER
 
 	  Say Y or M here if you have an Apple Silicon based Mac.
 
+config CHARGER_OPLUS_PMIC_PPS
+	tristate "OnePlus PMIC PPS charging policy"
+	depends on OF && BATTERY_QCOM_BATTMGR
+	help
+	  Event-driven USB PPS charging using the OnePlus ADSP PMIC buck path.
+	  Loads a validated default curve from DT, with transactional sysfs reload.
+	  Blocks system sleep while USB power is connected by default. If sleep
+	  is allowed via sysfs, restores basic charging before system suspend.
+	  Also restores basic charging on module removal.
+
 endif # POWER_SUPPLY

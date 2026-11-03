@@ -5,12 +5,14 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/auxiliary_bus.h>
+#include <linux/cleanup.h>
 #include <linux/devm-helpers.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/of_device.h>
 #include <linux/power_supply.h>
+#include <linux/power/qcom-battmgr-pps.h>
 #include <linux/property.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
@@ -123,6 +125,14 @@ enum qcom_battmgr_variant {
 #define OPLUS_USB_OTG_VBUS_REGULATOR_ENABLE		19
 #define OPLUS_USB_OTG_BOOST_CURRENT			59
 #define OPLUS_CHG_EN					70
+
+#define BATTMGR_OPLUS_PPS_CAPS			0x10004
+
+struct qcom_battmgr_pps_caps {
+	struct pmic_glink_hdr hdr;
+	__le32 words[128];
+	__le32 bytes;
+};
 
 struct qcom_battmgr_enable_request {
 	struct pmic_glink_hdr hdr;
@@ -346,6 +356,9 @@ struct qcom_battmgr {
 
 	int error;
 	struct completion ack;
+	spinlock_t response_lock;
+	u32 response_opcode, response_property;
+	bool response_pending;
 
 	bool service_up;
 
@@ -355,6 +368,8 @@ struct qcom_battmgr {
 	struct qcom_battmgr_usb usb;
 	struct qcom_battmgr_wireless wireless;
 	struct qcom_battmgr_oplus oplus;
+	u32 pps_value;
+	u32 pps_pdos[7];
 
 	struct work_struct enable_work;
 	struct work_struct oplus_otg_work;
@@ -369,22 +384,42 @@ struct qcom_battmgr {
 
 static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
 {
-	unsigned long left;
+	const struct qcom_battmgr_property_request *req = data;
+	unsigned long left, flags;
+	u32 opcode = le32_to_cpu(req->hdr.opcode);
 	int ret;
 
 	reinit_completion(&battmgr->ack);
-
 	battmgr->error = 0;
-
+	if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI) {
+		spin_lock_irqsave(&battmgr->response_lock, flags);
+		battmgr->response_opcode = opcode;
+		battmgr->response_property = U32_MAX;
+		switch (opcode) {
+		case BATTMGR_BAT_PROPERTY_GET:
+		case BATTMGR_USB_PROPERTY_GET:
+		case BATTMGR_USB_PROPERTY_SET:
+		case BATTMGR_WLS_PROPERTY_GET:
+		case BATTMGR_OPLUS_PROPERTY_GET:
+		case BATTMGR_OPLUS_PROPERTY_SET:
+			battmgr->response_property = le32_to_cpu(req->property);
+			break;
+		}
+		battmgr->response_pending = true;
+		spin_unlock_irqrestore(&battmgr->response_lock, flags);
+	}
 	ret = pmic_glink_send(battmgr->client, data, len);
 	if (ret < 0)
-		return ret;
-
+		goto clear;
 	left = wait_for_completion_timeout(&battmgr->ack, HZ);
-	if (!left)
-		return -ETIMEDOUT;
-
-	return battmgr->error;
+	ret = left ? battmgr->error : -ETIMEDOUT;
+clear:
+	if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI) {
+		spin_lock_irqsave(&battmgr->response_lock, flags);
+		battmgr->response_pending = false;
+		spin_unlock_irqrestore(&battmgr->response_lock, flags);
+	}
+	return ret > 0 ? -EREMOTEIO : ret;
 }
 
 static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
@@ -1095,6 +1130,83 @@ static int qcom_battmgr_usb_get_property(struct power_supply *psy,
 	return 0;
 }
 
+/* PPS shares the battmgr transaction lock: ADSP cannot service parallel
+ * battery-manager requests. Policy belongs to the PPS power_supply driver.
+ * values: TYPE[1], CAPS[7], TARGET[mV, mA], BASELINE[native ICL in uA].
+ */
+int qcom_battmgr_pps_request(struct power_supply *usb,
+			   enum qcom_battmgr_pps_command command, u32 *values)
+{
+	struct qcom_battmgr *battmgr;
+	struct {
+		struct pmic_glink_hdr hdr;
+		__le32 bytes;
+	} caps = {
+		.hdr = { cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+			 cpu_to_le32(PMIC_GLINK_REQ_RESP),
+			 cpu_to_le32(BATTMGR_OPLUS_PPS_CAPS) },
+		.bytes = cpu_to_le32(512),
+	};
+	int ret;
+
+	if (!usb || !values || usb->desc->get_property != qcom_battmgr_usb_get_property)
+		return -ENODEV;
+	battmgr = power_supply_get_drvdata(usb);
+	if (battmgr->variant != OPLUS_BATTMGR_KAANAPALI)
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&battmgr->lock);
+	if (!battmgr->service_up)
+		return -EAGAIN;
+	switch (command) {
+	case QCOM_BATTMGR_PPS_TYPE:
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET, 7, 0);
+		if (!ret)
+			values[0] = battmgr->pps_value;
+		return ret;
+	case QCOM_BATTMGR_PPS_CAPS:
+		ret = qcom_battmgr_request(battmgr, &caps, sizeof(caps));
+		if (!ret)
+			memcpy(values, battmgr->pps_pdos, sizeof(battmgr->pps_pdos));
+		return ret;
+	case QCOM_BATTMGR_PPS_TARGET:
+		if (values[0] < 5500 || values[0] > 10500 ||
+		    values[1] < 100 || values[1] > 3000)
+			return -ERANGE;
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+						  USB_ONLINE, 0);
+		if (ret)
+			return ret;
+		if (battmgr->usb.online != 1)
+			return -ENOTCONN;
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET, 7, 0);
+		if (ret)
+			return ret;
+		if (battmgr->pps_value != 8)
+			return -EOPNOTSUPP;
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
+						  30, values[1]);
+		if (!ret)
+			ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
+							  29, values[0]);
+		if (!ret)
+			ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+							  USB_INPUT_CURR_LIMIT, values[1] * 1000);
+		return ret;
+	case QCOM_BATTMGR_PPS_BASELINE:
+		if (values[0] < 100000 || values[0] > 5000000)
+			return -ERANGE;
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET, 71, 5000);
+		if (!ret)
+			ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+							  USB_INPUT_CURR_LIMIT, values[0]);
+		return ret;
+	default:
+		return -EINVAL;
+	}
+}
+EXPORT_SYMBOL_GPL(qcom_battmgr_pps_request);
+
 static const enum power_supply_property sc8280xp_usb_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 };
@@ -1274,7 +1386,10 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 			return;
 		case NOTIF_OPLUS_APSD_DONE:
 		case NOTIF_OPLUS_UFCS_DISABLE_MOS:
+			return;
 		case NOTIF_OPLUS_PD_SOURCECAP_DONE:
+			power_supply_changed(battmgr->usb_psy);
+			return;
 		case NOTIF_OPLUS_POWER_ROLE_STATUS:
 			return;
 		}
@@ -1459,6 +1574,23 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 
 	if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI) {
 		switch (opcode) {
+		case BATTMGR_OPLUS_PPS_CAPS: {
+			const struct qcom_battmgr_pps_caps *caps = (const void *)resp;
+			u32 bytes;
+			int i;
+
+			battmgr->error = -EPROTO;
+			if (len != sizeof(*caps))
+				goto out_complete;
+			bytes = le32_to_cpu(caps->bytes);
+			if (bytes < 36 || bytes > 512 || bytes % 4)
+				goto out_complete;
+			for (i = 0; i < ARRAY_SIZE(battmgr->pps_pdos); i++)
+				battmgr->pps_pdos[i] = le32_to_cpu(caps->words[i + 2]);
+			battmgr->error = 0;
+			goto out_complete;
+		}
+		case BATTMGR_USB_PROPERTY_SET:
 		case BATTMGR_OPLUS_PROPERTY_SET:
 		case BATTMGR_OPLUS_PROPERTY_GET:
 			property = le32_to_cpu(resp->intval.property);
@@ -1470,13 +1602,11 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 				return;
 			}
 
-			battmgr->error = le32_to_cpu(resp->intval.result);
+			battmgr->error = le32_to_cpu(resp->intval.result) ? -EREMOTEIO : 0;
 			if (battmgr->error)
 				goto out_complete;
 
-			if (opcode == BATTMGR_OPLUS_PROPERTY_GET) {
-				//printk("OPLUS: get property=%d value=%d result=%d\n", property, le32_to_cpu(resp->intval.value), le32_to_cpu(resp->intval.result));
-			}
+			battmgr->pps_value = le32_to_cpu(resp->intval.value);
 
 			goto out_complete;
 		}
@@ -1678,16 +1808,34 @@ out_complete:
 static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 {
 	const struct pmic_glink_hdr *hdr = data;
+	const struct qcom_battmgr_message *resp = data;
 	struct qcom_battmgr *battmgr = priv;
 	unsigned int opcode = le32_to_cpu(hdr->opcode);
+	unsigned long flags;
 
-	if (opcode == BATTMGR_NOTIFICATION)
+	if (opcode == BATTMGR_NOTIFICATION) {
 		qcom_battmgr_notification(battmgr, data, len);
-	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
-		 battmgr->variant == QCOM_BATTMGR_X1E80100)
-		qcom_battmgr_sc8280xp_callback(battmgr, data, len);
-	else
+		return;
+	}
+	if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI) {
+		/* A late PPS reply must never acknowledge a baseline/telemetry request. */
+		spin_lock_irqsave(&battmgr->response_lock, flags);
+		if (!battmgr->response_pending || opcode != battmgr->response_opcode ||
+		    (battmgr->response_property != U32_MAX &&
+		     (len < sizeof(*hdr) + sizeof(__le32) ||
+		      le32_to_cpu(resp->intval.property) != battmgr->response_property))) {
+			spin_unlock_irqrestore(&battmgr->response_lock, flags);
+			return;
+		}
+		battmgr->response_pending = false;
 		qcom_battmgr_sm8350_callback(battmgr, data, len);
+		spin_unlock_irqrestore(&battmgr->response_lock, flags);
+	} else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+		   battmgr->variant == QCOM_BATTMGR_X1E80100) {
+		qcom_battmgr_sc8280xp_callback(battmgr, data, len);
+	} else {
+		qcom_battmgr_sm8350_callback(battmgr, data, len);
+	}
 }
 
 static void qcom_battmgr_enable_worker(struct work_struct *work)
@@ -1700,6 +1848,7 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	};
 	int ret;
 
+	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
@@ -1709,6 +1858,10 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 		if (ret)
 			dev_err(battmgr->dev, "failed to enable OTG control from AP\n");
 	}
+	mutex_unlock(&battmgr->lock);
+	/* A PPS consumer can have probed while ADSP was still starting. */
+	power_supply_changed(battmgr->usb_psy);
+	power_supply_changed(battmgr->bat_psy);
 }
 
 static void qcom_battmgr_oplus_otg_worker(struct work_struct *work)
@@ -1753,6 +1906,7 @@ static void qcom_battmgr_oplus_charging_worker(struct work_struct *work)
 
 out:
 	mutex_unlock(&battmgr->lock);
+	power_supply_changed(battmgr->usb_psy);
 	return;
 }
 
@@ -1808,6 +1962,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.num_supplicants = 1;
 
 	mutex_init(&battmgr->lock);
+	spin_lock_init(&battmgr->response_lock);
 	init_completion(&battmgr->ack);
 
 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);

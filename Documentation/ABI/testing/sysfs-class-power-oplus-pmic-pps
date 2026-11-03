@@ -1,0 +1,54 @@
+What:           /sys/class/power_supply/oplus-pmic-pps/curve
+Date:           November 2026
+Contact:        Yibo Wang <wyibo6109@gmail.com>
+Description:
+                Write-only transactional PPS curve replacement. First write 1
+                to the standard online attribute to restore basic charging and
+                disable automatic PPS. From one process, write "begin 1", then
+                one row per write, then "commit" (or "abort"). Each row contains
+                ten decimal integers: SOC lower/upper percent (inclusive),
+                temperature lower/upper deci-Celsius (half-open), gear, source
+                mV, battery threshold mV, source mA, flags, timeout seconds.
+                Flags: 1 = last gear, 2 = CV. Format and validation match DT.
+                A failed transaction leaves the previous table untouched;
+                abort or begin a new transaction to recover. After committing,
+                write 2 to online to enable automatic PPS again. The original
+                DT table is loaded afresh on probe; reloads are not persistent.
+
+What:           /sys/class/power_supply/oplus-pmic-pps/policy_state
+Date:           November 2026
+Contact:        Yibo Wang <wyibo6109@gmail.com>
+Description:
+                Read-only policy state (basic/running/suspended/fault), last
+                error and requested mV/mA. A requested target is not a VBUS
+                measurement. Standard voltage_now/current_now report the last
+                PMIC measurements collected by policy work, in uV/uA.
+                ONLINE=0 means disconnected, 1 basic, 2 PPS. Writing online=1
+                restores basic charging, not charge inhibition; online=2
+                enables automatic PPS. PPS stops on an invalid measurement,
+                curve exhaustion or communication failure. Faults are latched
+                until unplug or an explicit online write. When block_suspend=0,
+                suspend restores basic charging before device suspend, then
+                resumes event-driven PPS on PM_POST_SUSPEND. No userspace
+                daemon is required.
+
+What:           /sys/class/power_supply/oplus-pmic-pps/block_suspend
+Date:           November 2026
+Contact:        Yibo Wang <wyibo6109@gmail.com>
+Description:
+                Read/write boolean, default 1 on every probe. While enabled,
+                USB power online holds a native wakeup source, including basic
+                charging and a fully charged battery. This keeps the policy
+                running without interrupting PPS for system sleep. USB removal
+                releases the hold. System suspend/hibernation preparation also
+                rechecks the connection and returns -EBUSY while online, without
+                changing the active charging policy. If the connection cannot
+                be read, preparation fails with that error rather than risking
+                a charging interruption.
+
+                Write 0 to release the hold and allow normal system sleep;
+                the driver must still restore basic charging before sleeping.
+                Write 1 to enable the policy again. This preference is separate
+                from the standard online property and does not enable/disable
+                PPS or charging. Writes during sleep preparation or teardown
+                return -EBUSY. The value is not persistent across reprobe.
