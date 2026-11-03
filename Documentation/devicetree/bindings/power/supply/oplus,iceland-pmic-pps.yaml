@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/oplus,iceland-pmic-pps.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: OnePlus Iceland PMIC USB PPS charger
+
+maintainers:
+  - Yibo Wang <wyibo6109@gmail.com>
+
+description: |
+  PPS charging policy for the ADSP-controlled PMIC buck on OnePlus Iceland.
+  The device is a board-level platform device, referencing the PMIC GLINK
+  transport. It does not represent an external charge pump. Commands share
+  the existing battery-manager transaction lock. Runtime limits are the
+  intersection of one PPS APDO and the board limits of 10.5 V and 3 A.
+  The default table follows the Oplus third-party PPS strategy. Battery
+  temperature is used because this board has no mainline shell sensor.
+
+properties:
+  compatible:
+    const: oplus,iceland-pmic-pps
+
+  oplus,pmic-glink:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PMIC GLINK device providing the battery-manager supplies.
+
+  oplus,pps-charge-curve:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: |
+      Rows are SOC lower and upper bounds (inclusive, percent), temperature
+      lower and upper bounds (half-open, deci-Celsius), gear number, source
+      voltage (mV), battery voltage threshold (mV), source current (mA), flags,
+      and gear timeout (seconds, zero disables). Flags are bit 0 last gear and
+      bit 1 constant-voltage dwell. Each group starts at gear zero, consecutive
+      gears share the SOC/temperature bounds, and the last gear sets bit 0.
+      Groups must not overlap. Voltages and currents may exceed board limits;
+      requests are always clamped to one real APDO and the board limits.
+    minItems: 1
+    maxItems: 512
+    items:
+      items:
+        - minimum: 0
+          maximum: 100
+        - minimum: 0
+          maximum: 100
+        - minimum: 0
+          maximum: 599
+        - minimum: 1
+          maximum: 600
+        - minimum: 0
+          maximum: 63
+        - minimum: 5500
+          maximum: 21000
+        - minimum: 2500
+          maximum: 4560
+        - minimum: 100
+          maximum: 15000
+          multipleOf: 50
+        - minimum: 0
+          maximum: 3
+        - minimum: 0
+          maximum: 86400
+
+required:
+  - compatible
+  - oplus,pmic-glink
+  - oplus,pps-charge-curve
+
+additionalProperties: false
+
+examples:
+  - |
+    charger-pps {
+        compatible = "oplus,iceland-pmic-pps";
+        oplus,pmic-glink = <&pmic_glink>;
+        oplus,pps-charge-curve = <0 90 160 450 0 9000 4490 2000 1 0>;
+    };
