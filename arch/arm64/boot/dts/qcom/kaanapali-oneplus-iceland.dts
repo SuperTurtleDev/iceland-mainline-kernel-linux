@@ -1483,6 +1483,14 @@
 	vdd3-supply = <&vreg_l5b_3p1>;
 };
 
+&pmih0108_e1_gpios {
+	svooc_mos_therm_default: svooc-mos-therm-default-state {
+		pins = "gpio15";
+		function = "normal";
+		bias-high-impedance;
+	};
+};
+
 &pmk8850_gpios {
 	/* 19.2 MHz camera MCLK outputs (RPMh DIV_CLK1 buffer, func2) */
 	cam_rear_mclk_default: cam-rear-mclk-default-state {
@@ -1497,6 +1505,43 @@
 		function = "func2";
 		output-enable;
 		power-source = <0>;
+	};
+};
+
+&pmk8850_vadc {
+	pinctrl-0 = <&svooc_mos_therm_default>;
+	pinctrl-names = "default";
+
+	status = "okay";
+
+	/* PMH0101 thermistors: SPMI bus 0, SID 1. */
+	channel@144 {
+		reg = <0x144>;
+		label = "pmh0101_skin_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@146 {
+		reg = <0x146>;
+		label = "pmh0101_wlan_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@148 {
+		reg = <0x148>;
+		label = "pmh0101_board_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+	};
+
+	/* PMIH0108 thermistor: SPMI bus 1, SID 7, GPIO15. */
+	channel@274b {
+		reg = <0x274b>;
+		label = "svooc_mos_btb_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
 	};
 };
 
