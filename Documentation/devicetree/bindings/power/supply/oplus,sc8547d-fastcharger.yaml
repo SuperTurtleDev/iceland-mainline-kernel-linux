@@ -1,0 +1,371 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/oplus,sc8547d-fastcharger.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: OnePlus fast charging over SC8547D charge pumps
+
+maintainers:
+  - Yibo Wang <wyibo6109@gmail.com>
+
+description: |
+  Fast charging session for OnePlus devices with one or two SC8547D charge
+  pumps behind a Qualcomm PMIC GLINK charger. USB PD PPS adapters are
+  negotiated through the PMIC, UFCS and SuperVOOC adapters through the PHYs
+  of the main pump, which needs the connector D+/D- routed to it through a
+  mux. Each protocol has a child node with its own constants, in the units
+  named by the property; temperatures are in tenths of a degree Celsius.
+
+  Protection counts, feedback steps and timings have stock defaults and
+  may be overridden per protocol. The power supply accepts a charge type to
+  enable or disable fast charging, an input current limit and a voltage
+  maximum as userspace caps.
+
+  Charge curve rows are soc_lo soc_hi temp_lo temp_hi gear vbus_mv vbat_mv
+  ibus_ma flags seconds. SOC bounds are inclusive, temperature bounds
+  half-open and must start at the region boundaries of the protocol. Gears
+  of one group are consecutive from zero and the last gear sets flag bit 0;
+  bit 1 marks a constant-voltage dwell. VOOC rows carry vbus_mv 0.
+
+properties:
+  compatible:
+    const: oplus,sc8547d-fastcharger
+
+  southchip,charge-pumps:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 2
+    description: The main pump first, then the optional second pump.
+
+  mux-states:
+    maxItems: 1
+    description: The D+/D- route to the main pump PHY, selected during a session.
+
+  io-channels:
+    minItems: 1
+    maxItems: 2
+
+  io-channel-names:
+    minItems: 1
+    items:
+      - const: battery-connector
+      - const: usb-connector
+
+  "#cooling-cells":
+    const: 2
+
+  oplus,pmic-glink:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PMIC GLINK device providing the battery-manager supplies.
+
+  oplus,connector-maximum-millicelsius:
+    default: 80000
+    description: Connector or pump temperature at which no session may run.
+
+  oplus,temperature-zone:
+    $ref: /schemas/types.yaml#/definitions/string
+    description:
+      Thermal zone with the shell temperature estimate. It drives the
+      strategy while the battery is above 32 C and below the dynamic warm
+      boundary (the last COMM threshold, at most 60 C) and the two agree
+      within 15 C; otherwise the battery temperature does.
+
+  oplus,comm-temperature-thresholds:
+    $ref: /schemas/types.yaml#/definitions/int32-array
+    minItems: 8
+    maxItems: 8
+    description:
+      The eight battery temperature boundaries of the stock common charger
+      (spec V3P7) in tenths of a degree Celsius, increasing. They expand to
+      the ten stock regions by repeating the little-cold and normal
+      boundaries; each boundary moves by 2 C of hysteresis when crossed.
+      Required with oplus,temperature-zone.
+
+  oplus,cooling-battery-current-milliamp:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 64
+    description:
+      Registers a thermal cooling device with one state per entry. Each
+      state caps the battery current to its entry, halved on the adapter
+      side by the 2:1 pumps. State 0 is no cooling and entries must not
+      increase from one state to the next.
+
+  oplus,protocols:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    minItems: 1
+    maxItems: 3
+    items:
+      enum: [vooc, ufcs, pps]
+    description: The protocols to probe on a new charger, in order.
+
+patternProperties:
+  "^(vooc|ufcs|pps)$":
+    type: object
+    additionalProperties: false
+    properties:
+      oplus,target-vbus-millivolt:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Adapter voltage the pumps are run at (pps, ufcs).
+      oplus,maximum-current-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Input current ceiling of the protocol.
+      oplus,start-current-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Current requested while the adapter voltage ramps up.
+      oplus,normal-current-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Current of a temperature region without a sub-state (pps, ufcs).
+      oplus,session-timeout-seconds:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Longest session; afterwards the adapter is reset and probed again.
+      oplus,battery-overcurrent-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Battery charge current counted as over-current.
+      oplus,full-voltages-millivolt:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        description: |
+          pps, ufcs: cool software, normal software, normal hardware, warm.
+          vooc: first and repeated full voltage of each of the seven regions.
+      oplus,full-recheck-temperature:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: At or below it a full charge only pauses until warmer.
+      oplus,low-temperature:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: No new session below it.
+      oplus,high-temperature:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: No new session at or above it.
+      oplus,soc-range-percent:
+        items:
+          - description: Lowest state of charge a session may start at.
+          - description: Highest state of charge a session may start at.
+      oplus,warm-soc-percent: true
+      oplus,warm-voltage-millivolt:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Highest VBAT admitted in the warm region.
+      oplus,temperature-boundaries:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 7
+        maxItems: 7
+        description:
+          Ends of the little-cold, cool, little-cool, little-cool-high,
+          normal-low and normal-high regions, then the over-high temperature.
+      oplus,high-temperature-thresholds:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 6
+        maxItems: 6
+        description: Three rising then three falling sub-state temperatures.
+      oplus,high-temperature-currents-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 6
+        maxItems: 6
+        description: Input current of each high-temperature sub-state.
+      oplus,second-pump-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 2
+        maxItems: 2
+        description: Input current opening, then closing, the second pump.
+      oplus,pump-maximum-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description:
+          Current one pump may carry. Required for vooc; for pps and ufcs it
+          caps the target while the second pump is out of play.
+      oplus,switch-curve-current-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Current to request before leaving for a new curve (ufcs).
+      oplus,full-counts:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 4
+        maxItems: 4
+        description: Cool, normal software, normal hardware and warm full counts.
+      oplus,battery-overcurrent-counts:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Consecutive over-current samples that stop the session.
+      oplus,battery-discharge-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Battery discharge current counted as a fault.
+      oplus,battery-discharge-counts:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Consecutive discharge samples that stop the session.
+      oplus,connector-over-counts:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Consecutive connector over-temperature samples that stop the session.
+      oplus,gauge-overtemperature:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Battery temperature at which the gauge protection stops the session.
+      oplus,gauge-overtemperature-counts:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Consecutive gauge over-temperature samples that stop the session.
+      oplus,start-vbus-delta-millivolt:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Adapter voltage above twice VBAT aimed at while starting.
+      oplus,start-vbus-window-millivolt:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Width of the pump input window accepted as started.
+      oplus,start-step-ms: true
+      oplus,start-retries:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Start steps before the session is given up.
+      oplus,second-pump-settle-ms: true
+      oplus,second-pump-minimum-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Least current the second pump must carry once on.
+      oplus,second-pump-retries:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Second pump failures before it stays off for the session.
+      oplus,feedback-vbus-step-millivolt:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 3
+        maxItems: 3
+        description: Voltage step, step on over-current and debounce (pps).
+      oplus,feedback-vbus-margin-millivolt:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 2
+        maxItems: 2
+        description: Pump input margin above twice VBAT and below the target (pps).
+      oplus,feedback-current-window-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 4
+        maxItems: 4
+        description: Current ok, ok when the request is low, over and disconnect (pps).
+      oplus,feedback-counts:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 3
+        maxItems: 3
+        description: Over-current, abnormal current and low request counts (pps).
+      oplus,adapter-watchdog-ms: true
+      oplus,adapter-low-current-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Adapter current below which the link counts as lost (ufcs).
+      oplus,adapter-low-current-counts:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Consecutive low current samples that stop the session (ufcs).
+      oplus,adapter-current-window-milliamp:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Current error tolerated before the voltage is adjusted (ufcs).
+      oplus,vbus-window-millivolt:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 2
+        maxItems: 2
+        description: VBUS minus twice VBAT window reported as normal (vooc).
+      oplus,circuit-codes:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 3
+        maxItems: 3
+        description:
+          Circuit resistance payload of the fast charge reply for SuperVOOC,
+          VOOC 3.0 and VOOC 2.0 adapters (vooc).
+      bypass:
+        type: object
+        additionalProperties: false
+        description:
+          VOOC 2.0 and 3.0 adapters run the pumps 1:1 on this curve (vooc).
+          Without it those adapters are declined.
+        properties:
+          oplus,maximum-current-milliamp:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            description: Input current ceiling of the 1:1 bypass mode.
+          oplus,battery-curve:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            minItems: 6
+            maxItems: 6
+            description: Three current (mA), voltage (mV) pairs the adapter reads.
+          oplus,charge-curve:
+            $ref: /schemas/types.yaml#/definitions/uint32-matrix
+            maxItems: 1024
+            items:
+              minItems: 10
+              maxItems: 10
+            description: Charge curve rows for the 1:1 pump ratio.
+        required:
+          - oplus,battery-curve
+          - oplus,charge-curve
+      oplus,battery-curve:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 6
+        maxItems: 6
+        description: Three current (mA), voltage (mV) pairs the adapter reads (vooc).
+      oplus,cgcl:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        description: |
+          Charge gear by temperature with hysteresis. Rows are cool heat
+          value heat_next cool_next; value is an input current for pps and
+          ufcs and a battery current for vooc.
+        items:
+          minItems: 5
+          maxItems: 5
+      oplus,low-current-full:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        description: Rows are temp_lo temp_hi iterm_ma vterm_mv exit.
+        items:
+          minItems: 5
+          maxItems: 5
+      oplus,charge-curve:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        maxItems: 1024
+        items:
+          minItems: 10
+          maxItems: 10
+        description: Charge curve rows, see the node description.
+    required:
+      - oplus,maximum-current-milliamp
+      - oplus,start-current-milliamp
+      - oplus,session-timeout-seconds
+      - oplus,battery-overcurrent-milliamp
+      - oplus,full-voltages-millivolt
+      - oplus,full-recheck-temperature
+      - oplus,low-temperature
+      - oplus,high-temperature
+      - oplus,soc-range-percent
+      - oplus,warm-soc-percent
+      - oplus,warm-voltage-millivolt
+      - oplus,temperature-boundaries
+      - oplus,cgcl
+      - oplus,low-current-full
+      - oplus,charge-curve
+
+required:
+  - compatible
+  - southchip,charge-pumps
+  - mux-states
+  - oplus,pmic-glink
+  - oplus,protocols
+
+additionalProperties: false
+
+examples:
+  - |
+    charger {
+        compatible = "oplus,sc8547d-fastcharger";
+        southchip,charge-pumps = <&charge_pump_main>;
+        mux-states = <&wcd_usbss 1>;
+        oplus,pmic-glink = <&pmic_glink>;
+        oplus,protocols = "pps";
+        #cooling-cells = <2>;
+        oplus,cooling-battery-current-milliamp = <20000 10000 5000 2000>;
+
+        pps {
+            oplus,target-vbus-millivolt = <11000>;
+            oplus,maximum-current-milliamp = <5000>;
+            oplus,start-current-milliamp = <1000>;
+            oplus,normal-current-milliamp = <5000>;
+            oplus,session-timeout-seconds = <33595>;
+            oplus,battery-overcurrent-milliamp = <11400>;
+            oplus,full-voltages-millivolt = <4500 4500 4540 4130>;
+            oplus,full-recheck-temperature = <210>;
+            oplus,low-temperature = <0>;
+            oplus,high-temperature = <500>;
+            oplus,soc-range-percent = <0 90>;
+            oplus,warm-soc-percent = <55>;
+            oplus,warm-voltage-millivolt = <4000>;
+            oplus,temperature-boundaries = <50 120 160 210 350 440 510>;
+            oplus,high-temperature-thresholds = <410 420 430 400 410 420>;
+            oplus,high-temperature-currents-milliamp = <5000 4000 3000 5000 5000 4000>;
+            oplus,cgcl = <0 385 7300 1 0>, <375 405 5000 2 0>;
+            oplus,low-current-full = <210 380 1000 4481 1>;
+            oplus,charge-curve = <0 90 210 350 0 11000 4490 2000 0 0>,
+                                 <0 90 210 350 1 11000 4500 1000 1 0>;
+        };
+    };

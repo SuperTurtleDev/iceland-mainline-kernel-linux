@@ -1255,6 +1255,8 @@ patternProperties:
     description: ON Semiconductor Corp.
   "^ontat,.*":
     description: On Tat Industrial Company
+  "^oplus,.*":
+    description: OPLUS Mobile Technology (Guangdong OPPO Mobile Telecommunications Corp.)
   "^opalkelly,.*":
     description: Opal Kelly Incorporated
   "^openailab,.*":
@@ -1597,6 +1599,8 @@ patternProperties:
     description: Sophgo Technology Inc.
   "^sourceparts,.*":
     description: Source Parts Inc.
+  "^southchip,.*":
+    description: Southchip Semiconductor Technology (Shanghai) Co., Ltd.
   "^spacemit,.*":
     description: SpacemiT (Hangzhou) Technology Co. Ltd
   "^spansion,.*":

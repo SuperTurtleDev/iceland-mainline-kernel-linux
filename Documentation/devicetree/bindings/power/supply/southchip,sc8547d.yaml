@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/southchip,sc8547d.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Southchip SC8547D charge pump
+
+maintainers:
+  - Yibo Wang <wyibo6109@gmail.com>
+
+description:
+  2:1 switched capacitor charge pump with built-in VOOC and UFCS PHYs on D+/D-.
+  The pump is driven by a direct charging driver that references it; it does
+  not charge on its own.
+
+properties:
+  compatible:
+    const: southchip,sc8547d
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  southchip,vbat-ovp-microvolt:
+    description: Battery over-voltage protection, 3.5 V to 5.075 V in 25 mV steps.
+    minimum: 3500000
+    maximum: 5075000
+    default: 4850000
+
+  southchip,vbus-ovp-microvolt:
+    description: Input over-voltage protection, 6 V to 12.35 V in 50 mV steps.
+    minimum: 6000000
+    maximum: 12350000
+    default: 10500000
+
+  southchip,ibus-ocp-microamp:
+    description: Input over-current protection, 1.2 A to 5.7 A in 300 mA steps.
+    minimum: 1200000
+    maximum: 5700000
+    default: 5700000
+
+  southchip,switching-frequency-hz:
+    enum: [500000, 600000]
+    default: 500000
+
+  southchip,always-otg-en:
+    type: boolean
+    description: Keep the OTG path of the pump enabled.
+
+  southchip,vooc-phy:
+    type: boolean
+    description: The VOOC PHY of this pump is wired to the connector D+/D-.
+
+  southchip,ufcs-phy:
+    type: boolean
+    description: The UFCS PHY of this pump is wired to the connector D+/D-.
+
+required:
+  - compatible
+  - reg
+
+allOf:
+  - if:
+      anyOf:
+        - required: [southchip,vooc-phy]
+        - required: [southchip,ufcs-phy]
+    then:
+      required:
+        - interrupts
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        charge-pump@6a {
+            compatible = "southchip,sc8547d";
+            reg = <0x6a>;
+            interrupts-extended = <&tlmm 0 IRQ_TYPE_EDGE_FALLING>;
+            southchip,vbat-ovp-microvolt = <4850000>;
+            southchip,vbus-ovp-microvolt = <10500000>;
+            southchip,ibus-ocp-microamp = <5700000>;
+            southchip,vooc-phy;
+            southchip,ufcs-phy;
+        };
+    };

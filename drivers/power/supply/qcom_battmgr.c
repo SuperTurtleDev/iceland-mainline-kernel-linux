@@ -361,6 +361,7 @@ struct qcom_battmgr {
 	bool response_pending;
 
 	bool service_up;
+	u32 service_generation;
 
 	struct qcom_battmgr_info info;
 	struct qcom_battmgr_status status;
@@ -592,6 +593,16 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = battmgr->status.status;
+		if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI &&
+		    val->intval == POWER_SUPPLY_STATUS_DISCHARGING) {
+			/* The firmware's buck state does not include external charge pumps. */
+			ret = qcom_battmgr_bat_sm8350_update(battmgr,
+						     POWER_SUPPLY_PROP_CURRENT_NOW);
+			if (ret < 0)
+				return ret;
+			if (battmgr->status.current_now > 0)
+				val->intval = POWER_SUPPLY_STATUS_CHARGING;
+		}
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
 		val->intval = battmgr->info.charge_type;
@@ -1130,12 +1141,23 @@ static int qcom_battmgr_usb_get_property(struct power_supply *psy,
 	return 0;
 }
 
-/* PPS shares the battmgr transaction lock: ADSP cannot service parallel
- * battery-manager requests. Policy belongs to the PPS power_supply driver.
- * values: TYPE[1], CAPS[7], TARGET[mV, mA], BASELINE[native ICL in uA].
+/* Property ids of the OnePlus battery manager used by the fast charger. */
+#define OPLUS_USB_INPUT_CURRENT_LIMIT		5
+#define OPLUS_USB_TYPE_PROP			7
+#define OPLUS_USB_SUBTYPE_PROP			8
+#define OPLUS_USB_SET_PPS_VOLT			29
+#define OPLUS_USB_SET_PPS_CURR			30
+#define OPLUS_SET_PDO				71
+#define OPLUS_USB_TYPE_PD_PPS			8
+
+/*
+ * The fast charging driver drives the adapter through the battery manager:
+ * PPS voltage and current requests, the buck input limit and charge enable.
+ * The battery manager cannot service parallel requests, so everything runs
+ * under its transaction lock. Policy belongs to the caller.
  */
 int qcom_battmgr_pps_request(struct power_supply *usb,
-			   enum qcom_battmgr_pps_command command, u32 *values)
+			     enum qcom_battmgr_pps_command command, u32 *values)
 {
 	struct qcom_battmgr *battmgr;
 	struct {
@@ -1149,7 +1171,7 @@ int qcom_battmgr_pps_request(struct power_supply *usb,
 	};
 	int ret;
 
-	if (!usb || !values || usb->desc->get_property != qcom_battmgr_usb_get_property)
+	if (!usb || usb->desc->get_property != qcom_battmgr_usb_get_property)
 		return -ENODEV;
 	battmgr = power_supply_get_drvdata(usb);
 	if (battmgr->variant != OPLUS_BATTMGR_KAANAPALI)
@@ -1159,8 +1181,29 @@ int qcom_battmgr_pps_request(struct power_supply *usb,
 	if (!battmgr->service_up)
 		return -EAGAIN;
 	switch (command) {
+	case QCOM_BATTMGR_PPS_ADAPTER_INFO:
+		values[2] = READ_ONCE(battmgr->service_generation);
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET,
+						    OPLUS_USB_TYPE_PROP, 0);
+		if (ret)
+			return ret;
+		values[0] = battmgr->pps_value;
+		values[1] = 0;
+		/* Stock soccp skips subtype on PD, PD_DRP and PD_PPS. */
+		if (values[0] < 6 || values[0] > OPLUS_USB_TYPE_PD_PPS) {
+			ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET,
+							    OPLUS_USB_SUBTYPE_PROP, 0);
+			/* Like stock, retain the base type if subtype is unavailable. */
+			if (!ret)
+				values[1] = battmgr->pps_value;
+		}
+		if (!READ_ONCE(battmgr->service_up) ||
+		    values[2] != READ_ONCE(battmgr->service_generation))
+			return -EAGAIN;
+		return 0;
 	case QCOM_BATTMGR_PPS_TYPE:
-		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET, 7, 0);
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET,
+						    OPLUS_USB_TYPE_PROP, 0);
 		if (!ret)
 			values[0] = battmgr->pps_value;
 		return ret;
@@ -1170,38 +1213,44 @@ int qcom_battmgr_pps_request(struct power_supply *usb,
 			memcpy(values, battmgr->pps_pdos, sizeof(battmgr->pps_pdos));
 		return ret;
 	case QCOM_BATTMGR_PPS_TARGET:
-		if (values[0] < 5500 || values[0] > 10500 ||
-		    values[1] < 100 || values[1] > 3000)
+		if (values[0] < 5000 || values[0] > 10500 ||
+		    values[1] < 100 || values[1] > 6500)
 			return -ERANGE;
 		ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-						  USB_ONLINE, 0);
+						    USB_ONLINE, 0);
 		if (ret)
 			return ret;
 		if (battmgr->usb.online != 1)
 			return -ENOTCONN;
-		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET, 7, 0);
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET,
+						    OPLUS_USB_TYPE_PROP, 0);
 		if (ret)
 			return ret;
-		if (battmgr->pps_value != 8)
+		if (battmgr->pps_value != OPLUS_USB_TYPE_PD_PPS)
 			return -EOPNOTSUPP;
 		/* Match the vendor sequence: request voltage before current. */
 		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
-						  29, values[0]);
+						    OPLUS_USB_SET_PPS_VOLT, values[0]);
 		if (!ret)
 			ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
-							  30, values[1]);
-		if (!ret)
-			ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-							  USB_INPUT_CURR_LIMIT, values[1] * 1000);
+							    OPLUS_USB_SET_PPS_CURR, values[1]);
 		return ret;
-	case QCOM_BATTMGR_PPS_BASELINE:
-		if (values[0] < 100000 || values[0] > 5000000)
+	case QCOM_BATTMGR_PPS_ICL:
+		if (values[0] > 5000000)
 			return -ERANGE;
-		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET, 71, 5000);
-		if (!ret)
-			ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-							  USB_INPUT_CURR_LIMIT, values[0]);
-		return ret;
+		return qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+						     USB_INPUT_CURR_LIMIT, values[0]);
+	case QCOM_BATTMGR_PPS_CHARGE_ENABLE:
+		return qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
+						     OPLUS_CHG_EN, !!values[0]);
+	case QCOM_BATTMGR_PPS_PDO_5V:
+		return qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
+						     OPLUS_SET_PDO, 5000);
+	case QCOM_BATTMGR_PPS_INPUT_SUSPEND:
+		/* oplus_chg_8350_input_suspend(): zero votes suspend, ~0 releases it. */
+		return qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
+						     OPLUS_USB_INPUT_CURRENT_LIMIT,
+						     values[0] ? 0 : U32_MAX);
 	default:
 		return -EINVAL;
 	}
@@ -1916,10 +1965,12 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 	struct qcom_battmgr *battmgr = priv;
 
 	if (state == SERVREG_SERVICE_STATE_UP) {
-		battmgr->service_up = true;
+		WRITE_ONCE(battmgr->service_generation,
+			   READ_ONCE(battmgr->service_generation) + 1);
+		WRITE_ONCE(battmgr->service_up, true);
 		schedule_work(&battmgr->enable_work);
 	} else {
-		battmgr->service_up = false;
+		WRITE_ONCE(battmgr->service_up, false);
 	}
 }
 

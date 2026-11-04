@@ -89,6 +89,36 @@ patternProperties:
           This property indicates ADC_TM monitoring is done on this channel.
         type: boolean
 
+      qcom,voltage-channel:
+        type: boolean
+        description:
+          Read a Gen4 GPIO AMUX input as voltage instead of applying the
+          built-in 100 kOhm thermistor curve. This is needed for thermistors
+          with a board-specific voltage-to-temperature table. The input must
+          use absolute calibration and cannot use ADC_TM monitoring. Supported
+          channel numbers are 0x4a through 0x4d and 0x5e, with the SPMI bus and
+          SID encoded in the upper bits of reg.
+
+    allOf:
+      - if:
+          required:
+            - qcom,voltage-channel
+        then:
+          properties:
+            qcom,ratiometric: false
+            qcom,adc-tm: false
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: qcom,spmi-adc5-gen3
+    then:
+      patternProperties:
+        "^channel@[0-9a-f]+$":
+          properties:
+            qcom,voltage-channel: false
+
 required:
   - compatible
   - reg

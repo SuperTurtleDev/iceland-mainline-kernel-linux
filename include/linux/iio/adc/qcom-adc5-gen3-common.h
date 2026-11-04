@@ -103,6 +103,8 @@
 #define ADC5_GEN3_AMUX4_GPIO_100K_PU		0x4d
 #define ADC5_GEN4_AMUX5_GPIO_100K_PU		0x5e
 
+#define ADC5_GEN4_CHG_TEMP			0x10
+
 #define ADC5_MAX_CHANNEL			0xc0
 
 enum adc5_cal_method {

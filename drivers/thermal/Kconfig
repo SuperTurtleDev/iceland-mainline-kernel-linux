@@ -489,6 +489,14 @@ config GENERIC_ADC_THERMAL
 
 menu "Qualcomm thermal drivers"
 depends on (ARCH_QCOM && OF) || COMPILE_TEST
+config OPLUS_SHELL_TEMP
+	tristate "OnePlus shell temperature estimator"
+	depends on OF && POWER_SUPPLY
+	help
+	  Estimates the device shell temperature from board thermistors and
+	  the battery with the linear model of the stock OnePlus thermal
+	  daemon, and exposes it as a thermal zone for the charging policy.
+
 source "drivers/thermal/qcom/Kconfig"
 endmenu
 

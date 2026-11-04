@@ -89,6 +89,7 @@ config TYPEC_MUX_WCD939X_USBSS
 	tristate "Qualcomm WCD939x USBSS Analog Audio Switch driver"
 	depends on I2C
 	select REGMAP_I2C
+	select MULTIPLEXER
 	help
 	  Driver for the Qualcomm WCD939x Audio Codec USBSS domain which
 	  provides support for muxing analog audio and sideband signals on a

@@ -35,6 +35,10 @@ properties:
   vdd-supply:
     description: USBSS VDD power supply
 
+  "#mux-state-cells":
+    const: 1
+    description: D+/D- route, 0 for the AP USB PHY and 1 for the charger PHY.
+
   mode-switch: true
   orientation-switch: true
 

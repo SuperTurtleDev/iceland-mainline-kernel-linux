@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Iceland fast charging: two SC8547D charge pumps, the WCD9395 D+/D- route
+ * and the per-protocol strategy constants of the public OnePlus SM8850
+ * source, commit 8be53e8b737a83a33512d5e0106cccb010a5c24c
+ * (kernel_platform/qcom/opensource/devicetree/oplus/oplus_chg/iceland_ivy/
+ * oplus-chg-iceland-common.dtsi and oplus-chg-iceland-80w.dtsi).
+ * Copyright (C) 2020-2024 Oplus. All rights reserved.
+ *
+ * All adapters are run with the stock third-party tables. Temperatures are
+ * in 0.1 C. The strategy temperature is the battery temperature, replaced
+ * by the shell estimate of the shell-temperature node under the stock COMM
+ * conditions.
+ */
+
+/ {
+	fastchg: charger {
+		compatible = "oplus,sc8547d-fastcharger";
+		southchip,charge-pumps = <&charge_pump_main>, <&charge_pump_second>;
+		mux-states = <&wcd_usbss 1>;
+		io-channels = <&pmk8850_vadc 0x2744>, <&pmk8850_vadc 0x2747>;
+		io-channel-names = "battery-connector", "usb-connector";
+		oplus,pmic-glink = <&pmic_glink>;
+		oplus,connector-maximum-millicelsius = <80000>;
+		oplus,protocols = "vooc", "ufcs", "pps";
+		/* Stock COMM: shell estimate while the battery is 32 C to 53 C and agrees within 15 C */
+		oplus,temperature-zone = "shell-back";
+		oplus,comm-temperature-thresholds = <(-100) 0 50 120 160 350 450 530>;
+		/*
+		 * Stock cool_down battery currents, halved by the 2:1 pumps. Thermal
+		 * cooling states grow with the cooling, so state N is stock level
+		 * 28 - N: state 0 is no limit, state 27 is level 1. No thermal zone
+		 * drives the device yet; userspace may set its state.
+		 */
+		#cooling-cells = <2>;
+		oplus,cooling-battery-current-milliamp = <20000 20000 19000 18000 17000 16000 15000
+							   14000 13000 12600 12000 11000 10000 9000
+							   8000 7400 7000 6400 6000 5400 5000 4400
+							   4000 3400 3000 2400 2000 2000>;
+
+		fastchg_vooc: vooc {
+			oplus,maximum-current-milliamp = <7500>;
+			oplus,start-current-milliamp = <1000>;
+			oplus,session-timeout-seconds = <33595>;
+			oplus,battery-overcurrent-milliamp = <16000>;
+			oplus,full-recheck-temperature = <210>;
+			oplus,low-temperature = <0>;
+			oplus,high-temperature = <500>;
+			oplus,soc-range-percent = <0 90>;
+			oplus,warm-soc-percent = <55>;
+			oplus,warm-voltage-millivolt = <4000>;
+			oplus,temperature-boundaries = <50 120 160 210 350 440 510>;
+			oplus,second-pump-milliamp = <1400 1100>;
+			oplus,pump-maximum-milliamp = <5300>;
+			oplus,vbus-window-millivolt = <100 200>;
+			/*
+			 * FASTCHG circuit payloads of the stock default branch (no
+			 * bidirectional or parallel flags): SuperVOOC, VOOC 3.0, VOOC 2.0.
+			 */
+			oplus,circuit-codes = <0x30 0x18 0x10>;
+			/* current mA, voltage mV pairs the adapter reads */
+			oplus,battery-curve = <7300 3414 2600 4664 1100 4664>;
+			/* first and repeated full voltage per temperature region */
+			oplus,full-voltages-millivolt = <4520 4510 4520 4510 4560 4550 4560 4550
+							 4560 4550 4560 4550 4140 4130>;
+			/* cool heat battery_mA heat_next cool_next */
+			oplus,cgcl = <0 400 15000 1 0>,
+				     <390 410 7000 2 0>,
+				     <400 420 5000 3 1>,
+				     <410 430 4000 4 2>,
+				     <420 440 3000 4 3>;
+
+			/* VOOC 2.0/3.0: pumps 1:1, the stock vooc_charge_strategy curve */
+			fastchg_vooc_bypass: bypass {
+				oplus,maximum-current-milliamp = <6000>;
+				oplus,battery-curve = <6000 3414 2600 4664 1100 4664>;
+			};
+		};
+
+		fastchg_ufcs: ufcs {
+			oplus,target-vbus-millivolt = <11000>;
+			oplus,maximum-current-milliamp = <6100>;
+			oplus,start-current-milliamp = <1000>;
+			oplus,normal-current-milliamp = <6100>;
+			oplus,session-timeout-seconds = <33595>;
+			oplus,battery-overcurrent-milliamp = <9400>;
+			/* cool software, normal software, normal hardware, warm */
+			oplus,full-voltages-millivolt = <4500 4500 4540 4130>;
+			oplus,full-recheck-temperature = <210>;
+			oplus,low-temperature = <0>;
+			oplus,high-temperature = <500>;
+			oplus,soc-range-percent = <0 85>;
+			oplus,warm-soc-percent = <55>;
+			oplus,warm-voltage-millivolt = <4000>;
+			oplus,temperature-boundaries = <50 120 160 210 350 440 510>;
+			oplus,high-temperature-thresholds = <410 420 430 400 410 420>;
+			oplus,high-temperature-currents-milliamp = <6000 5000 4000 4000 5000 6000>;
+			oplus,second-pump-milliamp = <1900 1600>;
+			oplus,pump-maximum-milliamp = <4000>;
+			oplus,switch-curve-current-milliamp = <4000>;
+			oplus,cgcl = <0 415 6100 1 0>,
+				     <385 428 6000 2 0>,
+				     <415 440 5000 3 1>,
+				     <430 450 3500 4 2>,
+				     <440 460 2000 4 3>;
+		};
+
+		fastchg_pps: pps {
+			oplus,target-vbus-millivolt = <11000>;
+			oplus,maximum-current-milliamp = <5000>;
+			oplus,start-current-milliamp = <1000>;
+			oplus,normal-current-milliamp = <5000>;
+			oplus,session-timeout-seconds = <33595>;
+			oplus,battery-overcurrent-milliamp = <11400>;
+			oplus,full-voltages-millivolt = <4500 4500 4540 4130>;
+			oplus,full-recheck-temperature = <210>;
+			oplus,low-temperature = <0>;
+			oplus,high-temperature = <500>;
+			oplus,soc-range-percent = <0 90>;
+			oplus,warm-soc-percent = <55>;
+			oplus,warm-voltage-millivolt = <4000>;
+			oplus,temperature-boundaries = <50 120 160 210 350 440 510>;
+			oplus,high-temperature-thresholds = <410 420 430 400 410 420>;
+			oplus,high-temperature-currents-milliamp = <5000 4000 3000 5000 5000 4000>;
+			oplus,second-pump-milliamp = <1900 1600>;
+			oplus,pump-maximum-milliamp = <4000>;
+			oplus,cgcl = <0 385 7300 1 0>,
+				     <375 405 5000 2 0>,
+				     <395 420 4000 3 1>,
+				     <410 430 3500 4 2>,
+				     <420 440 2000 4 3>;
+		};
+	};
+
+	shell_temp: shell-temperature {
+		compatible = "oplus,shell-temperature";
+		#thermal-sensor-cells = <0>;
+		/* Horae model inputs: sys-therm-2, sys-therm-4, board_temp, chg_cp_therm, battery */
+		oplus,thermal-zones = "adc-skin-thermal", "adc-wlan-thermal",
+				      "adc-board-thermal", "adc-mos-thermal";
+		oplus,battery = "qcom-battmgr-bat";
+		oplus,period-ms = <5000>;
+		oplus,history-reset-ms = <8000>;
+
+		model-back {
+			oplus,inputs = <0 1 2 4 3>;
+			oplus,history = <4>;
+			/* C0 .. C3, newest sample first, micro units */
+			oplus,coefficients-micro = <152302 (-177473) 1340440 (-129286) (-63388)>,
+						   <102490 (-296731) 545308 (-260550) 18606>,
+						   <63786 (-183312) 69828 (-365069) 13577>,
+						   <92480 176792 97647 (-364541) 121860>;
+			oplus,constant-microcelsius = <456600>;
+			oplus,battery-bias-millicelsius = <2000>;
+		};
+
+		model-back-1 {
+			oplus,inputs = <0 1 2 4 3>;
+			oplus,history = <4>;
+			/* C0 .. C3, newest sample first, micro units */
+			oplus,coefficients-micro = <23627 (-111185) 235102 (-174224) (-55890)>,
+						   <39721 (-88277) 561425 (-66857) 19010>,
+						   <46330 (-332330) 671352 (-88152) (-69641)>,
+						   <70980 (-216746) 180778 (-138645) 447351>;
+			oplus,constant-microcelsius = <258000>;
+			oplus,battery-bias-millicelsius = <2000>;
+		};
+	};
+};
+
+&i2c12 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	charge_pump_second: charge-pump@6a {
+		compatible = "southchip,sc8547d";
+		reg = <0x6a>;
+
+		interrupts-extended = <&tlmm 3 IRQ_TYPE_EDGE_FALLING>;
+		pinctrl-0 = <&cp_second_irq_default>;
+		pinctrl-names = "default";
+
+		southchip,vbat-ovp-microvolt = <4850000>;
+		southchip,vbus-ovp-microvolt = <10500000>;
+		southchip,ibus-ocp-microamp = <5400000>;
+		southchip,switching-frequency-hz = <600000>;
+	};
+};
+
+&i2c_hub_0 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	charge_pump_main: charge-pump@6a {
+		compatible = "southchip,sc8547d";
+		reg = <0x6a>;
+
+		interrupts-extended = <&tlmm 0 IRQ_TYPE_EDGE_FALLING>;
+		pinctrl-0 = <&cp_main_irq_default>;
+		pinctrl-names = "default";
+
+		southchip,vbat-ovp-microvolt = <4850000>;
+		southchip,vbus-ovp-microvolt = <10500000>;
+		southchip,ibus-ocp-microamp = <5700000>;
+		southchip,switching-frequency-hz = <500000>;
+		southchip,always-otg-en;
+		southchip,vooc-phy;
+		southchip,ufcs-phy;
+	};
+};
+
+&i2c_master_hub {
+	status = "okay";
+};
+
+&tlmm {
+	cp_main_irq_default: cp-main-irq-default-state {
+		pins = "gpio0";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	cp_second_irq_default: cp-second-irq-default-state {
+		pins = "gpio3";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+};
+
+&wcd_usbss {
+	#mux-state-cells = <1>;
+};
+
+#include "kaanapali-oneplus-iceland-fastcharge-curves.dtsi"

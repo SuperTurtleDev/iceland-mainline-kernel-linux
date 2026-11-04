@@ -1202,14 +1202,25 @@ config MACSMC_POWER
 
 	  Say Y or M here if you have an Apple Silicon based Mac.
 
-config CHARGER_OPLUS_PMIC_PPS
-	tristate "OnePlus PMIC PPS charging policy"
-	depends on OF && BATTERY_QCOM_BATTMGR
+config CHARGER_SC8547D
+	tristate "Southchip SC8547D charge pump"
+	depends on I2C
+	select REGMAP_I2C
 	help
-	  Event-driven USB PPS charging using the OnePlus ADSP PMIC buck path.
-	  Loads a validated default curve from DT, with transactional sysfs reload.
-	  Blocks system sleep while USB power is connected by default. If sleep
-	  is allowed via sysfs, restores basic charging before system suspend.
-	  Also restores basic charging on module removal.
+	  Say Y or M here for the Southchip SC8547D 2:1 switched capacitor
+	  charge pump with its VOOC and UFCS PHYs. The chip is driven by a
+	  direct charging driver such as the OnePlus SC8547D fast charger.
+
+config CHARGER_OPLUS_SC8547D
+	tristate "OnePlus SC8547D fast charging (PPS, UFCS, SuperVOOC)"
+	depends on OF && CHARGER_SC8547D && BATTERY_QCOM_BATTMGR
+	depends on IIO && MULTIPLEXER && THERMAL
+	help
+	  Say Y or M here for fast charging on OnePlus devices with two
+	  SC8547D charge pumps behind a Qualcomm PMIC GLINK charger. USB PD
+	  PPS adapters are negotiated through the PMIC; UFCS and SuperVOOC
+	  adapters through the pump PHYs. Strategy constants, thermal tables
+	  and charging curves come from the device tree; curves can be
+	  reloaded through sysfs.
 
 endif # POWER_SUPPLY

@@ -35,11 +35,13 @@ struct adc5_chip;
  * struct adc5_channel_prop - ADC channel structure
  * @common_props: structure with ADC channel properties (common to TM usage).
  * @adc_tm: indicates TM type if the channel is used for TM measurements.
+ * @voltage: report voltage in mV for an external temperature lookup table.
  * @chip: pointer to top-level ADC device structure.
  */
 struct adc5_channel_prop {
 	struct adc5_channel_common_prop common_props;
 	int adc_tm;
+	bool voltage;
 	struct adc5_chip *chip;
 };
 
@@ -355,6 +357,12 @@ static int adc5_gen3_read_raw(struct iio_dev *indio_dev,
 		if (ret)
 			return ret;
 
+		if (adc->chan_props[chan->address].voltage) {
+			/* The common scaler returns uV; IIO voltage units are mV. */
+			*val2 = 1000;
+			return IIO_VAL_FRACTIONAL;
+		}
+
 		return IIO_VAL_INT;
 	default:
 		return -EINVAL;
@@ -519,6 +527,23 @@ static int adc5_gen3_get_fw_channel_data(struct adc5_chip *adc,
 		prop->common_props.cal_method = ADC5_ABSOLUTE_CAL;
 
 	prop->adc_tm = fwnode_property_read_bool(fwnode, "qcom,adc-tm");
+	prop->voltage = (data->sid_mask == ADC5_GEN4_SID_MASK &&
+			 chan == ADC5_GEN4_CHG_TEMP) ||
+		fwnode_property_read_bool(fwnode, "qcom,voltage-channel");
+	if (prop->voltage) {
+		if (data->sid_mask != ADC5_GEN4_SID_MASK ||
+		    !((chan >= ADC5_GEN3_AMUX1_GPIO_100K_PU &&
+		       chan <= ADC5_GEN3_AMUX4_GPIO_100K_PU) ||
+		      chan == ADC5_GEN4_AMUX5_GPIO_100K_PU ||
+		      chan == ADC5_GEN4_CHG_TEMP))
+			return dev_err_probe(dev, -EINVAL,
+					     "%s voltage mode requires a Gen4 GPIO or charger channel\n",
+					     name);
+		if (prop->adc_tm || prop->common_props.cal_method != ADC5_ABSOLUTE_CAL)
+			return dev_err_probe(dev, -EINVAL,
+					     "%s voltage mode requires absolute calibration and no TM\n",
+					     name);
+	}
 	if (prop->adc_tm) {
 		adc->n_tm_channels++;
 		if (adc->n_tm_channels > (adc->dev_data.num_sdams * 8 - 1))
@@ -533,6 +558,7 @@ static int adc5_gen3_get_fw_channel_data(struct adc5_chip *adc,
 
 /* Gen4 numbers these channels as Gen3 does. */
 static const struct adc5_channels adc5_gen4_chans_pmic[ADC5_MAX_CHANNEL] = {
+	[ADC5_GEN4_CHG_TEMP]		= ADC5_CHAN_VOLT(0, SCALE_HW_CALIB_DEFAULT)
 	[ADC5_GEN3_REF_GND]		= ADC5_CHAN_VOLT(0, SCALE_HW_CALIB_DEFAULT)
 	[ADC5_GEN3_1P25VREF]		= ADC5_CHAN_VOLT(0, SCALE_HW_CALIB_DEFAULT)
 	[ADC5_GEN3_DIE_TEMP]		= ADC5_CHAN_TEMP(0,
@@ -644,6 +670,10 @@ static int adc5_get_fw_data(struct adc5_chip *adc)
 		iio_chan->channel = ADC5_GEN3_V_CHAN(chan_props->common_props);
 		iio_chan->info_mask_separate = adc_chan->info_mask;
 		iio_chan->type = adc_chan->type;
+		if (chan_props->voltage) {
+			chan_props->common_props.scale_fn_type = SCALE_HW_CALIB_DEFAULT;
+			iio_chan->type = IIO_VOLTAGE;
+		}
 		iio_chan->address = index;
 		iio_chan->indexed = 1;
 		iio_chan++;

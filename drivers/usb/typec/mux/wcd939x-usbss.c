@@ -12,6 +12,8 @@
 #include <linux/regmap.h>
 #include <linux/bitfield.h>
 #include <linux/gpio/consumer.h>
+#include <linux/mux/driver.h>
+#include <linux/property.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
 
@@ -197,7 +199,15 @@ struct wcd939x_usbss {
 	enum typec_orientation orientation;
 	unsigned long mode;
 	unsigned int svid;
+	bool dp_active;
+
+	struct mux_chip *dpdm_mux;
+	bool dpdm_charger;
+	bool suspended;
 };
+
+#define WCD939X_DPDM_USB	0
+#define WCD939X_DPDM_CHARGER	1
 
 static const struct regmap_range_cfg wcd939x_usbss_ranges[] = {
 	{
@@ -255,6 +265,7 @@ static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
 		/* DP Only */
 		case TYPEC_DP_STATE_C:
 		case TYPEC_DP_STATE_E:
+			enable_usb = true;
 			enable_dp = true;
 			break;
 
@@ -531,6 +542,108 @@ static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
 	return 0;
 }
 
+static int wcd939x_usbss_update_verify(struct wcd939x_usbss *usbss,
+				       unsigned int reg, unsigned int mask,
+				       unsigned int value)
+{
+	unsigned int read;
+	int ret;
+
+	ret = regmap_update_bits(usbss->regmap, reg, mask, value);
+	if (!ret)
+		ret = regmap_read(usbss->regmap, reg, &read);
+	if (!ret && (read & mask) != value)
+		ret = -EIO;
+	return ret;
+}
+
+/* Disconnect D+/D-, move them to DN2/DP2, reconnect: each step read back. */
+static int wcd939x_usbss_dpdm_route(struct wcd939x_usbss *usbss)
+{
+	const unsigned int enable = WCD_USBSS_SWITCH_SETTINGS_ENABLE_DNL_SWITCHES |
+				    WCD_USBSS_SWITCH_SETTINGS_ENABLE_DPR_SWITCHES;
+	const unsigned int select = WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES |
+				    WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES;
+	int ret;
+
+	ret = wcd939x_usbss_update_verify(usbss, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+					  enable, 0);
+	if (!ret)
+		ret = wcd939x_usbss_update_verify(usbss, WCD_USBSS_SWITCH_SELECT0, select,
+				FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
+					   WCD_USBSS_SWITCH_SELECT0_DNL_SWITCH_DN2) |
+				FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES,
+					   WCD_USBSS_SWITCH_SELECT0_DPR_SWITCH_DR2));
+	if (!ret)
+		ret = wcd939x_usbss_update_verify(usbss, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+						  enable, enable);
+	return ret;
+}
+
+static int wcd939x_usbss_dpdm_charger(struct wcd939x_usbss *usbss)
+{
+	unsigned int cntl, function, enable;
+	int ret;
+
+	/* Only a USB connection in manual mode lends its D+/D-. */
+	if (usbss->suspended || usbss->svid || usbss->dp_active ||
+	    usbss->orientation == TYPEC_ORIENTATION_NONE ||
+	    !(usbss->mode < TYPEC_STATE_MODAL || usbss->mode == TYPEC_MODE_USB2 ||
+	      usbss->mode == TYPEC_MODE_USB3))
+		return -EBUSY;
+	ret = regmap_read(usbss->regmap, WCD_USBSS_USB_SS_CNTL, &cntl);
+	if (!ret)
+		ret = regmap_read(usbss->regmap, WCD_USBSS_FUNCTION_ENABLE, &function);
+	if (!ret)
+		ret = regmap_read(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE, &enable);
+	if (ret)
+		return ret;
+	if ((cntl & WCD_USBSS_USB_SS_CNTL_STANDBY_STATE) ||
+	    FIELD_GET(WCD_USBSS_USB_SS_CNTL_USB_SS_MODE, cntl) !=
+	    WCD_USBSS_USB_SS_CNTL_USB_SS_MODE_USB ||
+	    FIELD_GET(WCD_USBSS_FUNCTION_ENABLE_SOURCE_SELECT, function) !=
+	    WCD_USBSS_FUNCTION_ENABLE_SOURCE_SELECT_MANUAL ||
+	    !(enable & WCD_USBSS_SWITCH_SETTINGS_ENABLE_DEVICE_ENABLE))
+		return -EBUSY;
+
+	usbss->dpdm_charger = true;
+	ret = wcd939x_usbss_dpdm_route(usbss);
+	if (ret) {
+		/* A failed write may still have landed: rebuild the USB route. */
+		usbss->dpdm_charger = false;
+		wcd939x_usbss_set(usbss);
+	}
+	return ret;
+}
+
+/* Give D+/D- back to the USB PHY by re-applying the Type-C state. */
+static int wcd939x_usbss_dpdm_release(struct wcd939x_usbss *usbss)
+{
+	if (!usbss->dpdm_charger)
+		return 0;
+	usbss->dpdm_charger = false;
+	return wcd939x_usbss_set(usbss);
+}
+
+static int wcd939x_usbss_dpdm_set(struct mux_control *mux, int state)
+{
+	struct wcd939x_usbss *usbss = *(struct wcd939x_usbss **)mux_chip_priv(mux->chip);
+	int ret;
+
+	mutex_lock(&usbss->lock);
+	if (state == WCD939X_DPDM_CHARGER)
+		ret = wcd939x_usbss_dpdm_charger(usbss);
+	else
+		ret = wcd939x_usbss_dpdm_release(usbss);
+	mutex_unlock(&usbss->lock);
+
+	return ret;
+}
+
+static const struct mux_control_ops wcd939x_usbss_dpdm_ops = {
+	.set = wcd939x_usbss_dpdm_set,
+};
+
 static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
 				    enum typec_orientation orientation)
 {
@@ -539,8 +652,15 @@ static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
 
 	mutex_lock(&usbss->lock);
 
+	/*
+	 * A real Type-C change takes D+/D- back from the charger. A repeat of
+	 * the same state leaves the route alone: the firmware reports the
+	 * connector again when a SuperVOOC adapter raises VBUS, and a glitch
+	 * on D+/D- then makes the adapter drop it.
+	 */
 	if (usbss->orientation != orientation) {
 		usbss->orientation = orientation;
+		usbss->dpdm_charger = false;
 
 		ret = wcd939x_usbss_set(usbss);
 	}
@@ -558,17 +678,25 @@ static int wcd939x_usbss_mux_set(struct typec_mux_dev *mux,
 				 struct typec_mux_state *state)
 {
 	struct wcd939x_usbss *usbss = typec_mux_get_drvdata(mux);
+	unsigned int svid = state->alt ? state->alt->svid : 0;
 	int ret = 0;
 
 	mutex_lock(&usbss->lock);
 
-	if (usbss->mode != state->mode) {
-		usbss->mode = state->mode;
+	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
+		usbss->dp_active = true;
+	} else if (state->mode == TYPEC_STATE_SAFE) {
+		usbss->dp_active = false;
+	} else if (state->mode == TYPEC_STATE_USB && usbss->dp_active) {
+		/* Keep the SBU switches carrying DP AUX */
+		mutex_unlock(&usbss->lock);
+		return 0;
+	}
 
-		if (state->alt)
-			usbss->svid = state->alt->svid;
-		else
-			usbss->svid = 0; // No SVID
+	if (usbss->mode != state->mode || usbss->svid != svid) {
+		usbss->mode = state->mode;
+		usbss->svid = svid;
+		usbss->dpdm_charger = false;
 
 		ret = wcd939x_usbss_set(usbss);
 	}
@@ -722,7 +850,27 @@ static int wcd939x_usbss_probe(struct i2c_client *client)
 
 	i2c_set_clientdata(client, usbss);
 
+	if (device_property_present(dev, "#mux-state-cells")) {
+		usbss->dpdm_mux = devm_mux_chip_alloc(dev, 1, sizeof(usbss));
+		if (IS_ERR(usbss->dpdm_mux)) {
+			ret = PTR_ERR(usbss->dpdm_mux);
+			goto err_mux_unregister;
+		}
+		*(struct wcd939x_usbss **)mux_chip_priv(usbss->dpdm_mux) = usbss;
+		usbss->dpdm_mux->ops = &wcd939x_usbss_dpdm_ops;
+		usbss->dpdm_mux->mux->states = 2;
+		usbss->dpdm_mux->mux->idle_state = WCD939X_DPDM_USB;
+		ret = mux_chip_register(usbss->dpdm_mux);
+		if (ret) {
+			dev_err_probe(dev, ret, "failed to register D+/D- mux\n");
+			goto err_mux_unregister;
+		}
+	}
+
 	return 0;
+
+err_mux_unregister:
+	typec_mux_unregister(usbss->mux);
 
 err_switch_unregister:
 	typec_switch_unregister(usbss->sw);
@@ -743,6 +891,12 @@ static void wcd939x_usbss_remove(struct i2c_client *client)
 {
 	struct wcd939x_usbss *usbss = i2c_get_clientdata(client);
 
+	if (usbss->dpdm_mux)
+		mux_chip_unregister(usbss->dpdm_mux);
+	mutex_lock(&usbss->lock);
+	wcd939x_usbss_dpdm_release(usbss);
+	mutex_unlock(&usbss->lock);
+
 	typec_mux_unregister(usbss->mux);
 	typec_switch_unregister(usbss->sw);
 
@@ -750,6 +904,38 @@ static void wcd939x_usbss_remove(struct i2c_client *client)
 
 	typec_switch_put(usbss->codec_switch);
 	typec_mux_put(usbss->codec);
+}
+
+static int wcd939x_usbss_suspend(struct device *dev)
+{
+	struct wcd939x_usbss *usbss = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&usbss->lock);
+	usbss->suspended = true;
+	ret = wcd939x_usbss_dpdm_release(usbss);
+	mutex_unlock(&usbss->lock);
+
+	return ret;
+}
+
+static int wcd939x_usbss_resume(struct device *dev)
+{
+	struct wcd939x_usbss *usbss = dev_get_drvdata(dev);
+
+	mutex_lock(&usbss->lock);
+	usbss->suspended = false;
+	mutex_unlock(&usbss->lock);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(wcd939x_usbss_pm_ops, wcd939x_usbss_suspend,
+				wcd939x_usbss_resume);
+
+static void wcd939x_usbss_shutdown(struct i2c_client *client)
+{
+	wcd939x_usbss_suspend(&client->dev);
 }
 
 static const struct i2c_device_id wcd939x_usbss_table[] = {
@@ -768,9 +954,11 @@ static struct i2c_driver wcd939x_usbss_driver = {
 	.driver = {
 		.name = "wcd939x-usbss",
 		.of_match_table = wcd939x_usbss_of_table,
+		.pm = pm_sleep_ptr(&wcd939x_usbss_pm_ops),
 	},
 	.probe		= wcd939x_usbss_probe,
 	.remove		= wcd939x_usbss_remove,
+	.shutdown	= wcd939x_usbss_shutdown,
 	.id_table	= wcd939x_usbss_table,
 };
 module_i2c_driver(wcd939x_usbss_driver);

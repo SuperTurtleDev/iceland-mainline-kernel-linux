@@ -1,0 +1,20 @@
+What:           /sys/class/power_supply/oplus-fastchg/priority
+Date:           November 2026
+Contact:        Linux Power Supply Mailing List <linux-pm@vger.kernel.org>
+Description:
+                Read or replace the protocol probe order. Values are lowercase
+                protocol names separated by whitespace, listed from highest to
+                lowest priority. For example: "pps ufcs vooc".
+
+                The initial order comes from the device tree's oplus,protocols
+                property. A write must contain each configured protocol exactly
+                once. Unknown, unconfigured, missing or repeated protocols, an
+                empty value or embedded NUL bytes are rejected with EINVAL; the
+                previous order remains unchanged. Writes during initialization,
+                protocol probing or removal return EBUSY.
+
+                Updates are atomic and affect the next complete probe pass.
+                Writing this attribute does not restart detection, switch an active
+                charging session or change charger-type and safety checks.
+                The setting lasts until the driver is reloaded or the device
+                reboots, when the device-tree default is restored.

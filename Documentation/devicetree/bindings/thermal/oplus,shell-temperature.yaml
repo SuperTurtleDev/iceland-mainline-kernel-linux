@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/thermal/oplus,shell-temperature.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: OnePlus shell temperature estimator
+
+maintainers:
+  - Yibo Wang <wyibo6109@gmail.com>
+
+description: |
+  Estimates the device shell temperature from thermal zones and the battery
+  with the linear model of the stock OnePlus thermal daemon. Each model-*
+  child node is one model over the last few samples:
+
+    Y = sum over history k and input i of C[k][i] * T[k][i] + b
+
+  The zone reports the largest model output. Until a model's history is
+  full it reports the battery temperature plus its bias; a gap longer than
+  the reset interval between samples starts the history over.
+
+properties:
+  compatible:
+    const: oplus,shell-temperature
+
+  "#thermal-sensor-cells":
+    const: 0
+
+  oplus,thermal-zones:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    minItems: 1
+    maxItems: 8
+    description: Input thermal zones, numbered from 0 in this order.
+
+  oplus,battery:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Power supply whose temperature is the last input.
+
+  oplus,period-ms:
+    default: 5000
+
+  oplus,history-reset-ms:
+    default: 8000
+
+patternProperties:
+  "^model-[a-z0-9-]+$":
+    type: object
+    additionalProperties: false
+    properties:
+      oplus,inputs:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        description: Input indexes; the number of thermal zones selects the battery.
+      oplus,history:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        minimum: 1
+        maximum: 4
+        description: Number of past samples the model spans.
+      oplus,coefficients-micro:
+        $ref: /schemas/types.yaml#/definitions/int32-matrix
+        description: One row per history sample, newest first, in millionths.
+      oplus,constant-microcelsius:
+        $ref: /schemas/types.yaml#/definitions/int32
+        description: Model constant b in millionths of a degree Celsius.
+      oplus,battery-bias-millicelsius:
+        description: Added to the battery temperature while the history fills.
+    required:
+      - oplus,inputs
+      - oplus,history
+      - oplus,coefficients-micro
+      - oplus,constant-microcelsius
+      - oplus,battery-bias-millicelsius
+
+required:
+  - compatible
+  - "#thermal-sensor-cells"
+  - oplus,thermal-zones
+  - oplus,battery
+
+additionalProperties: false
+
+examples:
+  - |
+    shell-temperature {
+        compatible = "oplus,shell-temperature";
+        #thermal-sensor-cells = <0>;
+        oplus,thermal-zones = "skin", "board";
+        oplus,battery = "battery";
+
+        model-back {
+            oplus,inputs = <0 1 2>;
+            oplus,history = <2>;
+            oplus,coefficients-micro = <500000 (-100000) 600000>,
+                                       <100000 100000 (-200000)>;
+            oplus,constant-microcelsius = <456600>;
+            oplus,battery-bias-millicelsius = <2000>;
+        };
+    };
