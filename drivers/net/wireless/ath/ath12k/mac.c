@@ -5820,6 +5820,9 @@ abort:
 			if (!arvif)
 				continue;
 
+			if (!arvif->ar)
+				continue;
+
 			ar = arvif->ar;
 			if (ar->scan.arvif == arvif) {
 				wiphy_work_cancel(hw->wiphy, &ar->scan.vdev_clean_wk);
