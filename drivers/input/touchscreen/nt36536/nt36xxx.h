@@ -18,6 +18,7 @@
 #ifndef 	_LINUX_NVT_TOUCH_H
 #define		_LINUX_NVT_TOUCH_H
 
+#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/input.h>
 #include <linux/of.h>
@@ -150,6 +151,9 @@ struct nvt_ts_data {
 	bool pen_input_dev_enable;
 	/* Pen source arbitration, all protected by lock. */
 	bool pen_present;
+	bool pen_position_valid;
+	atomic_t pen_proximity_count;
+	u8 pen_proximity_votes;
 	u8 pen_sources;
 	u8 pen_buttons;
 	u8 pen_ic_buttons;

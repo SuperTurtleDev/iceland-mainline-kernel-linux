@@ -56,7 +56,28 @@ static uint8_t bTouchIsAwake = 0;
 static DEFINE_MUTEX(nvt_control_lock);
 static struct nvt_ts_data *nvt_control_ts;
 
-/* Caller holds data->lock; coordinates and proximity remain IC-owned. */
+#define NVT_PROXIMITY_IC		BIT(0)
+#define NVT_PROXIMITY_STYLUS	BIT(1)
+#define NVT_PROXIMITY_STYLUS2	BIT(2)
+
+/* Caller holds data->lock; each source can own at most one vote. */
+static void vote_proximity(struct nvt_ts_data *data, u8 source)
+{
+	if (data->pen_proximity_votes & source)
+		return;
+	data->pen_proximity_votes |= source;
+	atomic_inc(&data->pen_proximity_count);
+}
+
+static void devote_proximity(struct nvt_ts_data *data, u8 source)
+{
+	if (!(data->pen_proximity_votes & source))
+		return;
+	data->pen_proximity_votes &= ~source;
+	atomic_dec(&data->pen_proximity_count);
+}
+
+/* Caller holds data->lock; forced proximity must never enable tip pressure. */
 static void nvt_pen_report_state(struct nvt_ts_data *data)
 {
 	struct input_dev *pen = data->pen_input_dev;
@@ -64,31 +85,32 @@ static void nvt_pen_report_state(struct nvt_ts_data *data)
 	u8 buttons = 0;
 	u8 owned = (data->pen_sources >> 1) & 3;
 
-	/* BLE side buttons are usable even when the pen is away from the IC. */
-	buttons = data->pen_buttons & owned;
+	/* Outside IC range, side buttons use the last valid pen position. */
+	if (data->pen_position_valid)
+		buttons = data->pen_buttons & owned;
 	if (data->pen_present) {
 		pressure = data->pen_sources & NVT_PEN_SOURCE_PRESSURE ?
 			data->pen_pressure : data->pen_ic_pressure;
 		buttons |= data->pen_ic_buttons & ~owned;
+		vote_proximity(data, NVT_PROXIMITY_IC);
 	}
+	if (buttons & 1)
+		vote_proximity(data, NVT_PROXIMITY_STYLUS);
+	if (buttons & 2)
+		vote_proximity(data, NVT_PROXIMITY_STYLUS2);
+
 	input_report_abs(pen, ABS_PRESSURE, pressure);
 	input_report_key(pen, BTN_TOUCH, !!pressure);
 	input_report_key(pen, BTN_STYLUS, buttons & 1);
 	input_report_key(pen, BTN_STYLUS2, !!(buttons & 2));
-	input_report_key(pen, BTN_TOOL_PEN, data->pen_present &&
-			 (!!input_abs_get_val(pen, ABS_DISTANCE) || !!pressure));
-}
-
-/* Leave range without losing BLE button state or the last pen position. */
-static void nvt_pen_leave(void)
-{
-	ts->pen_present = false;
-	ts->pen_pressure = 0;
-	ts->pen_ic_pressure = 0;
-	ts->pen_ic_buttons = 0;
-	input_report_abs(ts->pen_input_dev, ABS_DISTANCE, 0);
-	nvt_pen_report_state(ts);
-	input_sync(ts->pen_input_dev);
+	input_report_key(pen, BTN_TOOL_PEN,
+			 atomic_read(&data->pen_proximity_count) > 0);
+	if (!(buttons & 2))
+		devote_proximity(data, NVT_PROXIMITY_STYLUS2);
+	if (!(buttons & 1))
+		devote_proximity(data, NVT_PROXIMITY_STYLUS);
+	if (!data->pen_present)
+		devote_proximity(data, NVT_PROXIMITY_IC);
 }
 
 /* Caller holds ts->lock. Retain source selection but discard session values. */
@@ -97,12 +119,21 @@ void nvt_pen_reset(void)
 	if (!ts->pen_input_dev)
 		return;
 
+	ts->pen_present = false;
+	ts->pen_position_valid = false;
+	ts->pen_proximity_votes = 0;
+	atomic_set(&ts->pen_proximity_count, 0);
+	ts->pen_pressure = 0;
+	ts->pen_ic_pressure = 0;
 	ts->pen_buttons = 0;
+	ts->pen_ic_buttons = 0;
 	input_report_abs(ts->pen_input_dev, ABS_X, 0);
 	input_report_abs(ts->pen_input_dev, ABS_Y, 0);
 	input_report_abs(ts->pen_input_dev, ABS_TILT_X, 0);
 	input_report_abs(ts->pen_input_dev, ABS_TILT_Y, 0);
-	nvt_pen_leave();
+	input_report_abs(ts->pen_input_dev, ABS_DISTANCE, 0);
+	nvt_pen_report_state(ts);
+	input_sync(ts->pen_input_dev);
 }
 
 /* Reserved local namespace; malformed messages must not reach the firmware. */
@@ -1252,6 +1283,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 				input_report_abs(ts->pen_input_dev, ABS_TILT_Y, pen_tilt_y);
 				input_report_abs(ts->pen_input_dev, ABS_DISTANCE, pen_distance);
 				ts->pen_present = true;
+				ts->pen_position_valid = true;
 				ts->pen_ic_pressure = pen_pressure;
 				ts->pen_ic_buttons = pen_btn1 | (pen_btn2 << 1);
 				nvt_pen_report_state(ts);
@@ -1264,7 +1296,13 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 				goto UNHANDLED_FRAME;
 			}
 		} else { // pen_format_id = 0xFF, i.e. no pen present
-			nvt_pen_leave();
+			/* Keep XY and BLE button votes until their own release. */
+			ts->pen_present = false;
+			ts->pen_pressure = 0;
+			ts->pen_ic_pressure = 0;
+			ts->pen_ic_buttons = 0;
+			input_report_abs(ts->pen_input_dev, ABS_DISTANCE, 0);
+			nvt_pen_report_state(ts);
 		}
 
 		input_sync(ts->pen_input_dev);
@@ -1451,6 +1489,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		NVT_ERR("failed to allocated memory for nvt ts data\n");
 		return -ENOMEM;
 	}
+	atomic_set(&ts->pen_proximity_count, 0);
 
 	ts->xbuf = (uint8_t *)kzalloc(NVT_XBUF_LEN, GFP_KERNEL);
 	if (ts->xbuf == NULL) {
