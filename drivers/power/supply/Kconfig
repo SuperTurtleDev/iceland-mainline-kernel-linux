@@ -1223,4 +1223,15 @@ config CHARGER_OPLUS_SC8547D
 	  and charging curves come from the device tree; curves can be
 	  reloaded through sysfs.
 
+config CHARGER_OPLUS_MT5806_PENCIL
+	tristate "OnePlus pencil wireless charging transmitter (MT5806)"
+	depends on I2C && GPIOLIB && REGULATOR
+	select REGMAP_I2C
+	help
+	  Say Y or M here for the MT5806 wireless power transmitter that
+	  charges the stylus docked on OnePlus tablets. The driver reports
+	  the pencil as a device-scoped battery, exposes the Bluetooth
+	  address received over the charging link and lets userspace feed
+	  the pencil's state of charge back for recharge decisions.
+
 endif # POWER_SUPPLY

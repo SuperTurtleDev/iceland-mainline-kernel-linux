@@ -79,6 +79,14 @@ properties:
       - const: charge_limit_end
       - const: charge_limit_delta
 
+  oplus,hboost-regulator:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Regulator node describing the PMIC HBOOST rail whose output voltage
+      the Oplus charger firmware programs over PMIC GLINK, from 2 V to
+      14.75 V in 50 mV steps. The rail is always on; only its voltage can
+      be set.
+
 patternProperties:
   '^connector@\d$':
     $ref: /schemas/connector/usb-connector.yaml#

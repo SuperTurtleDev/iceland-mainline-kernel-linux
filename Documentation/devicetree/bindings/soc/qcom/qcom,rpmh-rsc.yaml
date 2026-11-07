@@ -122,6 +122,10 @@ patternProperties:
     $ref: /schemas/regulator/qcom,rpmh-regulator.yaml#
     unevaluatedProperties: false
 
+  '^regulator-[a-z0-9]+$':
+    $ref: /schemas/regulator/qcom,rpmh-xob-regulator.yaml#
+    unevaluatedProperties: false
+
 required:
   - compatible
   - interrupts

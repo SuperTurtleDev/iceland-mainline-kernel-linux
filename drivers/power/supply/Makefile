@@ -137,3 +137,4 @@ obj-$(CONFIG_MACSMC_POWER)	+= macsmc-power.o
 obj-$(CONFIG_CHARGER_MAX77759)	+= max77759_charger.o
 obj-$(CONFIG_CHARGER_SC8547D)	+= oplus-sc8547d/
 obj-$(CONFIG_CHARGER_OPLUS_SC8547D)	+= oplus-sc8547d/
+obj-$(CONFIG_CHARGER_OPLUS_MT5806_PENCIL)	+= oplus-pencil-mt5806.o

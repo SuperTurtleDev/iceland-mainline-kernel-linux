@@ -1,0 +1,44 @@
+What:		/sys/class/power_supply/oplus-pencil/ble_mac_addr
+Date:		November 2026
+Contact:	Linux Power Supply Mailing List <linux-pm@vger.kernel.org>
+Description:
+		Bluetooth address of the docked pencil as received over the
+		wireless charging link, in xx:xx:xx:xx:xx:xx form. Reads as
+		all zeros while no identified pencil is docked (present is 0).
+		The address lets userspace pair with and connect to the
+		pencil; the charging link itself does not authenticate it.
+
+		Access: Read
+		Valid values: Represented as a colon-separated hexadecimal
+		MAC address
+
+What:		/sys/class/power_supply/oplus-pencil/pencil_id
+Date:		November 2026
+Contact:	Linux Power Supply Mailing List <linux-pm@vger.kernel.org>
+Description:
+		Pencil model identifier byte from the identity packets, or 0
+		while no identified pencil is docked.
+
+		Access: Read
+		Valid values: 0 - 255
+
+What:		/sys/class/power_supply/oplus-pencil/misplaced
+Date:		November 2026
+Contact:	Linux Power Supply Mailing List <linux-pm@vger.kernel.org>
+Description:
+		1 while the transmitter reports that the pencil sits off the
+		charging coil, 0 otherwise. A change event is emitted when
+		the state changes.
+
+		Access: Read
+		Valid values: 0 or 1
+
+What:		/sys/class/power_supply/oplus-pencil/fw_version
+Date:		November 2026
+Contact:	Linux Power Supply Mailing List <linux-pm@vger.kernel.org>
+Description:
+		Transmitter firmware version as major.minor, each four
+		hexadecimal digits.
+
+		Access: Read
+		Valid values: Represented as string

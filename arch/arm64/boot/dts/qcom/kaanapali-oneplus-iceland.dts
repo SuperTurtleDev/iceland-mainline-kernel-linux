@@ -1813,3 +1813,5 @@
 #include "kaanapali-oneplus-iceland-fastcharge.dtsi"
 
 #include "kaanapali-oneplus-iceland-thermal.dtsi"
+
+#include "kaanapali-oneplus-iceland-pencil.dtsi"

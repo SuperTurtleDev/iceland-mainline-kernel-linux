@@ -1020,6 +1020,17 @@ config REGULATOR_MTK_DVFSRC
 	  of Mediatek. It allows for voting on regulator state
 	  between multiple users.
 
+config REGULATOR_OPLUS_PMIC_GLINK_HBOOST
+	tristate "Oplus PMIC GLINK HBOOST regulator"
+	depends on QCOM_PMIC_GLINK && OF
+	help
+	  This driver controls the voltage of the PMIC HBOOST rail on Oplus
+	  devices where the Qualcomm charger firmware programs it over PMIC
+	  GLINK. The rail feeds the pencil wireless charging transmitter.
+
+	  Say M here to build the driver as a module. The module will be
+	  called oplus-pmic-glink-hboost.
+
 config REGULATOR_PALMAS
 	tristate "TI Palmas PMIC Regulators"
 	depends on MFD_PALMAS
@@ -1175,6 +1186,16 @@ config REGULATOR_QCOM_RPMH
 	  block found on Qualcomm Technologies Inc. SoCs.  RPMh regulator
 	  control allows for voting on regulator state between multiple
 	  processors within the SoC.
+
+config REGULATOR_QCOM_RPMH_XOB
+	tristate "Qualcomm RPMh on/off resource regulators"
+	depends on QCOM_RPMH && QCOM_COMMAND_DB
+	help
+	  This driver votes on RPMh resources that only support being switched
+	  on or off, such as the bidirectional GPIO level shifters of PMH0101.
+	  Each resource is described as its own regulator node under the RSC
+	  and addressed by its command database name. Votes are sent without
+	  waiting for the resource to acknowledge them.
 
 config REGULATOR_QCOM_SMD_RPM
 	tristate "Qualcomm SMD based RPM regulator driver"

@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/regulator/qcom,rpmh-xob-regulator.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm RPMh on/off resource regulator
+
+maintainers:
+  - Yibo Wang <wyibo6109@gmail.com>
+
+description:
+  An RPMh resource that only supports being switched on or off, such as a
+  PMIC bidirectional GPIO level shifter. The node is a child of the RSC
+  device node and is voted on by its command database name.
+
+allOf:
+  - $ref: regulator.yaml#
+
+properties:
+  compatible:
+    const: qcom,rpmh-xob-regulator
+
+  qcom,resource-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Command database name of the resource, for example LS3B_E0.
+
+required:
+  - compatible
+  - qcom,resource-name
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    rsc {
+        regulator-ls3b {
+            compatible = "qcom,rpmh-xob-regulator";
+            qcom,resource-name = "LS3B_E0";
+            regulator-name = "pmh0101_ls3";
+            regulator-always-on;
+        };
+    };

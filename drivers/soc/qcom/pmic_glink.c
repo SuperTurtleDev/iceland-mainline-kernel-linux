@@ -40,6 +40,8 @@ struct pmic_glink {
 	struct auxiliary_device altmode_aux;
 	struct auxiliary_device ps_aux;
 	struct auxiliary_device ucsi_aux;
+	struct auxiliary_device hboost_aux;
+	bool hboost;
 
 	/* serializing client_state and pdr_state updates */
 	struct mutex state_lock;
@@ -341,6 +343,14 @@ static int pmic_glink_probe(struct platform_device *pdev)
 			goto out_release_altmode_aux;
 	}
 
+	/* Oplus firmware exposes a voltage-programmable HBOOST rail on some boards. */
+	pg->hboost = of_property_present(pdev->dev.of_node, "oplus,hboost-regulator");
+	if (pg->hboost) {
+		ret = pmic_glink_add_aux_device(pg, &pg->hboost_aux, "hboost");
+		if (ret)
+			goto out_release_ps_aux;
+	}
+
 	if (pg->data->charger_pdr_service_name && pg->data->charger_pdr_service_path) {
 		service = pdr_add_lookup(pg->pdr, pg->data->charger_pdr_service_name,
 					 pg->data->charger_pdr_service_path);
@@ -358,6 +368,9 @@ static int pmic_glink_probe(struct platform_device *pdev)
 	return 0;
 
 out_release_aux_devices:
+	if (pg->hboost)
+		pmic_glink_del_aux_device(pg, &pg->hboost_aux);
+out_release_ps_aux:
 	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_BATT))
 		pmic_glink_del_aux_device(pg, &pg->ps_aux);
 out_release_altmode_aux:
@@ -378,6 +391,8 @@ static void pmic_glink_remove(struct platform_device *pdev)
 
 	pdr_handle_release(pg->pdr);
 
+	if (pg->hboost)
+		pmic_glink_del_aux_device(pg, &pg->hboost_aux);
 	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_BATT))
 		pmic_glink_del_aux_device(pg, &pg->ps_aux);
 	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_ALTMODE))

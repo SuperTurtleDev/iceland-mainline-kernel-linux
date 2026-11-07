@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * OnePlus Pad 4 (Iceland) pencil wireless charging transmitter.
+ *
+ * Wiring follows the stock device tree: MT5806 on I2C hub port 1,
+ * interrupt on TLMM GPIO 169, control lines on PMIH0108 GPIOs 2/7/8/11
+ * behind the PMH0101 LS3/LS4 level shifters, input rail from the PMIC
+ * HBOOST programmed by the charger firmware.
+ */
+
+/ {
+	pencil_hboost: regulator-pencil-hboost {
+		regulator-name = "pencil_hboost";
+		regulator-min-microvolt = <7000000>;
+		regulator-max-microvolt = <10000000>;
+		regulator-always-on;
+	};
+};
+
+&apps_rsc {
+	regulator-ls3b {
+		compatible = "qcom,rpmh-xob-regulator";
+		qcom,resource-name = "LS3B_E0";
+		regulator-name = "pmh0101_ls3";
+		regulator-always-on;
+	};
+
+	regulator-ls4b {
+		compatible = "qcom,rpmh-xob-regulator";
+		qcom,resource-name = "LS4B_E0";
+		regulator-name = "pmh0101_ls4";
+		regulator-always-on;
+	};
+};
+
+&i2c_hub_1 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	pencil_charger: charger@2b {
+		compatible = "oplus,wls-tx-mt5806";
+		reg = <0x2b>;
+
+		interrupts-extended = <&tlmm 169 IRQ_TYPE_EDGE_FALLING>;
+
+		hboost-supply = <&pencil_hboost>;
+
+		power-gpios = <&pmih0108_e1_gpios 8 GPIO_ACTIVE_HIGH>;
+		wakeup-gpios = <&pmih0108_e1_gpios 2 GPIO_ACTIVE_HIGH>;
+		scan-gpios = <&pmih0108_e1_gpios 7 GPIO_ACTIVE_HIGH>;
+		charge-off-gpios = <&pmih0108_e1_gpios 11 GPIO_ACTIVE_HIGH>;
+
+		oplus,hboost-idle-microvolt = <7000000>;
+		oplus,hboost-charge-microvolt = <10000000>;
+		oplus,recharge-soc-percent = <80>;
+		oplus,charge-timeout-sec = <7200>;
+
+		pinctrl-0 = <&pencil_irq_default>,
+			    <&pencil_ctrl_default>,
+			    <&pencil_power_default>,
+			    <&pencil_charge_off_default>,
+			    <&pencil_level_shifter_default>;
+		pinctrl-names = "default";
+	};
+};
+
+&pmh0101_gpios {
+	pencil_level_shifter_default: pencil-level-shifter-default-state {
+		pins = "gpio15", "gpio16", "gpio17", "gpio18";
+		function = "normal";
+		bias-high-impedance;
+	};
+};
+
+&pmic_glink {
+	oplus,hboost-regulator = <&pencil_hboost>;
+};
+
+&pmih0108_e1_gpios {
+	pencil_ctrl_default: pencil-ctrl-default-state {
+		pins = "gpio2", "gpio7";
+		function = "normal";
+		input-disable;
+		bias-disable;
+		power-source = <1>;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
+	};
+
+	pencil_power_default: pencil-power-default-state {
+		pins = "gpio8";
+		function = "normal";
+		input-disable;
+		bias-disable;
+		power-source = <2>;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
+	};
+
+	pencil_charge_off_default: pencil-charge-off-default-state {
+		pins = "gpio11";
+		function = "normal";
+		input-disable;
+		bias-disable;
+	};
+};
+
+&tlmm {
+	pencil_irq_default: pencil-irq-default-state {
+		pins = "gpio169";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+};
