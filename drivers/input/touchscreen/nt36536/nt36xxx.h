@@ -148,6 +148,13 @@ struct nvt_ts_data {
 	uint8_t y_gang_num;
 	struct input_dev *pen_input_dev;
 	bool pen_input_dev_enable;
+	/* Pen source arbitration, all protected by lock. */
+	bool pen_present;
+	u8 pen_sources;
+	u8 pen_buttons;
+	u8 pen_ic_buttons;
+	u16 pen_pressure;
+	u16 pen_ic_pressure;
 	int8_t pen_phys[32];
 	int result_type;
 	int panel_index;
@@ -157,6 +164,8 @@ struct nvt_ts_data {
 	struct workqueue_struct *event_wq;
 	struct work_struct resume_work;
 	bool panel_on;
+	bool fw_ready;
+	bool fw_ready_notified;
 };
 
 typedef enum {
@@ -204,6 +213,8 @@ void nvt_fw_crc_enable(void);
 void nvt_tx_auto_copy_mode(void);
 void nvt_read_fw_history(uint32_t fw_history_addr);
 int32_t nvt_update_firmware(const char *firmware_name);
+void nvt_fw_ready_notify(void);
+void nvt_pen_reset(void);
 int32_t nvt_check_fw_reset_state(RST_COMPLETE_STATE check_reset_state);
 int32_t nvt_get_fw_info(void);
 int32_t nvt_clear_fw_status(void);

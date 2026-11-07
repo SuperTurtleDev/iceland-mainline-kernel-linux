@@ -3,6 +3,7 @@
 #
 config TOUCHSCREEN_NT36536_SPI
 	tristate "Novatek NT36536 host download SPI driver"
+	depends on NET
 	default n
 	help
 	  Say Y here if you have a Novatek NT36536 no flash touchscreen connected

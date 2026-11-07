@@ -838,6 +838,10 @@ int32_t nvt_update_firmware(const char *firmware_name)
 {
 	int32_t ret = 0;
 
+	ts->fw_ready = false;
+	ts->fw_ready_notified = false;
+	nvt_pen_reset();
+
 	// request bin file in "/etc/firmware"
 	ret = update_firmware_request(firmware_name);
 	if (ret) {
@@ -880,6 +884,8 @@ download_fail:
 	update_firmware_release();
 request_firmware_fail:
 
+	ts->fw_ready = !ret;
+	nvt_fw_ready_notify();
 	return ret;
 }
 

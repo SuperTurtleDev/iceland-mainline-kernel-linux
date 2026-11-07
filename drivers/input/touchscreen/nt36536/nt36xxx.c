@@ -23,6 +23,8 @@
 #include <linux/proc_fs.h>
 #include <linux/input/mt.h>
 #include <linux/of_irq.h>
+#include <net/genetlink.h>
+#include <uapi/linux/nt36536.h>
 #include <uapi/linux/sched/types.h>
 #include "nt36xxx.h"
 
@@ -49,6 +51,217 @@ uint32_t ENG_RST_ADDR  = 0x7FFF80;
 uint32_t SPI_RD_FAST_ADDR = 0;	//read from dtsi
 
 static uint8_t bTouchIsAwake = 0;
+
+/* Serializes userspace writes against unbind; SPI uses ts->lock as usual. */
+static DEFINE_MUTEX(nvt_control_lock);
+static struct nvt_ts_data *nvt_control_ts;
+
+/* Caller holds data->lock; coordinates and proximity remain IC-owned. */
+static void nvt_pen_report_state(struct nvt_ts_data *data)
+{
+	struct input_dev *pen = data->pen_input_dev;
+	u16 pressure = 0;
+	u8 buttons = 0;
+	u8 owned = (data->pen_sources >> 1) & 3;
+
+	if (data->pen_present) {
+		pressure = data->pen_sources & NVT_PEN_SOURCE_PRESSURE ?
+			data->pen_pressure : data->pen_ic_pressure;
+		buttons = (data->pen_buttons & owned) |
+			  (data->pen_ic_buttons & ~owned);
+	}
+	input_report_abs(pen, ABS_PRESSURE, pressure);
+	input_report_key(pen, BTN_TOUCH, !!pressure);
+	input_report_key(pen, BTN_STYLUS, buttons & 1);
+	input_report_key(pen, BTN_STYLUS2, !!(buttons & 2));
+	input_report_key(pen, BTN_TOOL_PEN, data->pen_present &&
+			 (!!input_abs_get_val(pen, ABS_DISTANCE) || !!pressure));
+}
+
+/* Caller holds ts->lock. Retain source selection but discard session values. */
+void nvt_pen_reset(void)
+{
+	if (!ts->pen_input_dev)
+		return;
+
+	ts->pen_present = false;
+	ts->pen_pressure = 0;
+	ts->pen_ic_pressure = 0;
+	ts->pen_buttons = 0;
+	ts->pen_ic_buttons = 0;
+	input_report_abs(ts->pen_input_dev, ABS_X, 0);
+	input_report_abs(ts->pen_input_dev, ABS_Y, 0);
+	input_report_abs(ts->pen_input_dev, ABS_TILT_X, 0);
+	input_report_abs(ts->pen_input_dev, ABS_TILT_Y, 0);
+	input_report_abs(ts->pen_input_dev, ABS_DISTANCE, 0);
+	nvt_pen_report_state(ts);
+	input_sync(ts->pen_input_dev);
+}
+
+/* Reserved local namespace; malformed messages must not reach the firmware. */
+static int nvt_pen_downlink(struct nvt_ts_data *data, const u8 *cmd, int len)
+{
+	u16 pressure;
+	u8 changed, sources;
+
+	if (!data->pen_input_dev)
+		return -ENODEV;
+	if (len < NVT_PEN_LOCAL_PREFIX_LEN + 1)
+		return -EINVAL;
+
+	switch (cmd[4]) {
+	case NVT_PEN_LOCAL_PRESSURE:
+		if (len != 7)
+			return -EINVAL;
+		if (!(data->pen_sources & NVT_PEN_SOURCE_PRESSURE))
+			return -EPERM;
+		pressure = cmd[5] | (cmd[6] << 8);
+		if (pressure > PEN_PRESSURE_MAX)
+			return -ERANGE;
+		data->pen_pressure = pressure;
+		break;
+	case NVT_PEN_LOCAL_BUTTONS:
+		if (len != 6 || (cmd[5] & ~3U))
+			return -EINVAL;
+		if (!(data->pen_sources &
+		      (NVT_PEN_SOURCE_STYLUS | NVT_PEN_SOURCE_STYLUS2)) ||
+		    (cmd[5] & ~((data->pen_sources >> 1) & 3)))
+			return -EPERM;
+		data->pen_buttons = cmd[5];
+		break;
+	case NVT_PEN_LOCAL_SOURCES:
+		if (len != 6 || (cmd[5] & ~NVT_PEN_SOURCE_MASK))
+			return -EINVAL;
+		sources = cmd[5];
+		changed = data->pen_sources ^ sources;
+		if (changed & NVT_PEN_SOURCE_PRESSURE)
+			data->pen_pressure = 0;
+		data->pen_buttons &= ~(changed >> 1);
+		data->pen_sources = sources;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	nvt_pen_report_state(data);
+	input_sync(data->pen_input_dev);
+	return 0;
+}
+
+/* Caller holds ts->lock. A firmware reload discards userspace configuration. */
+void nvt_fw_ready_notify(void)
+{
+	char *envp[] = { "NVT_FIRMWARE=ready", NULL };
+
+	if (!ts->fw_ready || ts->fw_ready_notified || !bTouchIsAwake ||
+	    ts->dev_pm_suspend)
+		return;
+
+	ts->fw_ready_notified = true;
+	kobject_uevent_env(&ts->client->dev.kobj, KOBJ_CHANGE, envp);
+}
+
+static int nvt_control_send(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nvt_ts_data *data;
+	u8 buf[NVT_CONTROL_CMD_MAX + 1];
+	int len, ret;
+
+	if (!netlink_capable(skb, CAP_SYS_ADMIN))
+		return -EPERM;
+	if (GENL_REQ_ATTR_CHECK(info, NVT_ATTR_DATA))
+		return -EINVAL;
+
+	len = nla_len(info->attrs[NVT_ATTR_DATA]);
+	if (len < 1 || len > NVT_CONTROL_CMD_MAX)
+		return -EINVAL;
+	buf[0] = EVENT_MAP_HOST_CMD;
+	memcpy(buf + 1, nla_data(info->attrs[NVT_ATTR_DATA]), len);
+
+	mutex_lock(&nvt_control_lock);
+	data = nvt_control_ts;
+	if (!data) {
+		ret = -ENODEV;
+		goto unlock_control;
+	}
+
+	mutex_lock(&data->lock);
+	if (!data->fw_ready || !bTouchIsAwake || data->dev_pm_suspend) {
+		ret = -EHOSTDOWN;
+		goto unlock_device;
+	}
+
+	if (len >= NVT_PEN_LOCAL_PREFIX_LEN &&
+	    !memcmp(buf + 1, NVT_PEN_LOCAL_PREFIX, NVT_PEN_LOCAL_PREFIX_LEN)) {
+		ret = nvt_pen_downlink(data, buf + 1, len);
+		goto unlock_device;
+	}
+
+	ret = nvt_set_page(data->mmap->EVENT_BUF_ADDR);
+	if (!ret)
+		ret = CTP_SPI_WRITE(data->client, buf, len + 1);
+
+unlock_device:
+	mutex_unlock(&data->lock);
+unlock_control:
+	mutex_unlock(&nvt_control_lock);
+	return ret;
+}
+
+static const struct nla_policy nvt_control_policy[NVT_ATTR_MAX + 1] = {
+	[NVT_ATTR_DATA] = NLA_POLICY_RANGE(NLA_BINARY, 1, NVT_CONTROL_CMD_MAX),
+	[NVT_ATTR_DEVICE] = { .type = NLA_REJECT },
+};
+
+static const struct genl_ops nvt_control_ops[] = {
+	{
+		.cmd = NVT_CMD_SEND,
+		.doit = nvt_control_send,
+		.policy = nvt_control_policy,
+		.maxattr = NVT_ATTR_MAX,
+	},
+};
+
+static const struct genl_multicast_group nvt_control_groups[] = {
+	{ .name = NVT_GENL_GROUP },
+};
+
+static struct genl_family nvt_control_family = {
+	.name = NVT_GENL_NAME,
+	.version = NVT_GENL_VERSION,
+	.module = THIS_MODULE,
+	.ops = nvt_control_ops,
+	.n_ops = ARRAY_SIZE(nvt_control_ops),
+	.mcgrps = nvt_control_groups,
+	.n_mcgrps = ARRAY_SIZE(nvt_control_groups),
+};
+
+static void nvt_control_event(const u8 *frame)
+{
+	struct sk_buff *skb;
+	void *hdr;
+	const char *name = dev_name(&ts->client->dev);
+
+	if (!genl_has_listeners(&nvt_control_family, &init_net, 0))
+		return;
+
+	skb = genlmsg_new(nla_total_size(NVT_CONTROL_FRAME_SIZE) +
+			  nla_total_size(strlen(name) + 1), GFP_KERNEL);
+	if (!skb)
+		return;
+	hdr = genlmsg_put(skb, 0, 0, &nvt_control_family, 0, NVT_CMD_EVENT);
+	if (!hdr)
+		goto free_skb;
+	if (nla_put_string(skb, NVT_ATTR_DEVICE, name) ||
+	    nla_put(skb, NVT_ATTR_DATA, NVT_CONTROL_FRAME_SIZE, frame))
+		goto free_skb;
+	genlmsg_end(skb, hdr);
+	/* Best effort: no listeners or a full receive queue may drop the frame. */
+	genlmsg_multicast(&nvt_control_family, skb, 0, 0, GFP_KERNEL);
+	return;
+
+free_skb:
+	nlmsg_free(skb);
+}
 
 /*******************************************************
 Description:
@@ -716,17 +929,8 @@ static void release_touch_event(void) {
 }
 
 static void release_pen_event(void) {
-	if (ts && ts->pen_input_dev) {
-		input_report_abs(ts->pen_input_dev, ABS_X, 0);
-		input_report_abs(ts->pen_input_dev, ABS_Y, 0);
-		input_report_abs(ts->pen_input_dev, ABS_PRESSURE, 0);
-		input_report_abs(ts->pen_input_dev, ABS_TILT_X, 0);
-		input_report_abs(ts->pen_input_dev, ABS_TILT_Y, 0);
-		input_report_abs(ts->pen_input_dev, ABS_DISTANCE, 0);
-		input_report_key(ts->pen_input_dev, BTN_TOUCH, 0);
-		input_report_key(ts->pen_input_dev, BTN_TOOL_PEN, 0);
-		input_sync(ts->pen_input_dev);
-	}
+	if (ts)
+		nvt_pen_reset();
 }
 
 /*******************************************************
@@ -890,6 +1094,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 	uint8_t press_id[TOUCH_MAX_FINGER_NUM] = {0};
 	int32_t i = 0;
 	int32_t finger_cnt = 0;
+	bool unhandled = false;
 	uint8_t pen_format_id = 0;
 	uint32_t pen_x = 0;
 	uint32_t pen_y = 0;
@@ -945,11 +1150,25 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 		goto XFER_ERROR;
 	}
 
+	/* An unknown report must not release existing finger or pen contacts. */
+	input_id = point_data[1] >> 3;
+	if ((!input_id && point_data[1]) ||
+	    (input_id > ts->max_touch_num && point_data[1] != 0xff))
+		goto UNHANDLED_FRAME;
+
 	for (i = 0; i < ts->max_touch_num; i++) {
 		position = 1 + 6 * i;
 		input_id = (uint8_t)(point_data[position + 0] >> 3);
-		if (input_id > ts->max_touch_num)
+		/* Empty coordinate slots are padding, not userspace messages. */
+		if (!point_data[position] || point_data[position] == 0xff)
 			continue;
+		if (!input_id || input_id > ts->max_touch_num) {
+			unhandled = true;
+			continue;
+		}
+		/* Zero/inactive and up records are handled by slot release below. */
+		if ((point_data[position] & 0x07) > 0x03)
+			unhandled = true;
 
 		if (((point_data[position] & 0x07) == 0x01) ||
 		    ((point_data[position] & 0x07) == 0x02)) {
@@ -959,8 +1178,10 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 			input_y = (uint32_t)(point_data[position + 1] << 8) + (uint32_t) (point_data[position + 2]);
 			input_y = (ts->abs_y_max - 1) - input_y;
 			//NVT_LOG("input_x=%5d input_y=%5d\n", input_x, input_y);
-			if ((input_x > ts->abs_x_max) || (input_y > ts->abs_y_max))
+			if ((input_x > ts->abs_x_max) || (input_y > ts->abs_y_max)) {
+				unhandled = true;
 				continue;
+			}
 			input_w = (uint32_t)(point_data[position + 5]);
 			if (input_w == 0)
 				input_w = 1;
@@ -1010,7 +1231,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 				pen_y = (uint32_t)(point_data[69] << 8) + (uint32_t)(point_data[70]);
 				pen_pressure = (uint32_t)(point_data[71] << 8) + (uint32_t)(point_data[72]);
 				pen_tilt_x = (int32_t)point_data[73];
-				pen_tilt_y = (int32_t)point_data[74];
+				pen_tilt_y = -(int8_t)point_data[74];
 				pen_distance = (uint32_t)(point_data[75] << 8) + (uint32_t)(point_data[76]);
 				pen_btn1 = (uint32_t)(point_data[77] & 0x01);
 				pen_btn2 = (uint32_t)((point_data[77] >> 1) & 0x01);
@@ -1020,33 +1241,34 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 
 				input_report_abs(ts->pen_input_dev, ABS_X, pen_x);
 				input_report_abs(ts->pen_input_dev, ABS_Y, pen_y);
-				input_report_abs(ts->pen_input_dev, ABS_PRESSURE, pen_pressure);
-				input_report_key(ts->pen_input_dev, BTN_TOUCH, !!pen_pressure);
 				input_report_abs(ts->pen_input_dev, ABS_TILT_X, pen_tilt_x);
 				input_report_abs(ts->pen_input_dev, ABS_TILT_Y, pen_tilt_y);
 				input_report_abs(ts->pen_input_dev, ABS_DISTANCE, pen_distance);
-				input_report_key(ts->pen_input_dev, BTN_TOOL_PEN, !!pen_distance || !!pen_pressure);
+				ts->pen_present = true;
+				ts->pen_ic_pressure = pen_pressure;
+				ts->pen_ic_buttons = pen_btn1 | (pen_btn2 << 1);
+				nvt_pen_report_state(ts);
 				// TBD: pen battery event report
 				// NVT_LOG("pen_battery=%d\n", pen_battery);
 			} else if (pen_format_id == 0xF0) {
-				// report Pen ID
+				/* Pen identity is not decoded by the input driver. */
+				unhandled = true;
 			} else {
-				NVT_ERR("Unknown pen format id!\n");
-				goto XFER_ERROR;
+				goto UNHANDLED_FRAME;
 			}
 		} else { // pen_format_id = 0xFF, i.e. no pen present
-			input_report_abs(ts->pen_input_dev, ABS_X, 0);
-			input_report_abs(ts->pen_input_dev, ABS_Y, 0);
-			input_report_abs(ts->pen_input_dev, ABS_PRESSURE, 0);
-			input_report_abs(ts->pen_input_dev, ABS_TILT_X, 0);
-			input_report_abs(ts->pen_input_dev, ABS_TILT_Y, 0);
-			input_report_abs(ts->pen_input_dev, ABS_DISTANCE, 0);
-			input_report_key(ts->pen_input_dev, BTN_TOUCH, 0);
-			input_report_key(ts->pen_input_dev, BTN_TOOL_PEN, 0);
+			nvt_pen_reset();
 		}
 
 		input_sync(ts->pen_input_dev);
 	} /* if (ts->pen_support) */
+
+	if (!unhandled)
+		goto XFER_ERROR;
+
+UNHANDLED_FRAME:
+	/* Preserve the whole frame when any report in it remains undecoded. */
+	nvt_control_event(point_data + 1);
 
 XFER_ERROR:
 
@@ -1358,6 +1580,8 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		ts->pen_input_dev->evbit[0] = BIT_MASK(EV_SYN) | BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
 		ts->pen_input_dev->keybit[BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH);
 		ts->pen_input_dev->keybit[BIT_WORD(BTN_TOOL_PEN)] |= BIT_MASK(BTN_TOOL_PEN);
+		input_set_capability(ts->pen_input_dev, EV_KEY, BTN_STYLUS);
+		input_set_capability(ts->pen_input_dev, EV_KEY, BTN_STYLUS2);
 		//ts->pen_input_dev->keybit[BIT_WORD(BTN_TOOL_RUBBER)] |= BIT_MASK(BTN_TOOL_RUBBER);
 		ts->pen_input_dev->propbit[0] = BIT(INPUT_PROP_DIRECT);
 
@@ -1429,6 +1653,14 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 	nvt_irq_enable(true);
 
+	mutex_lock(&nvt_control_lock);
+	nvt_control_ts = ts;
+	mutex_unlock(&nvt_control_lock);
+
+	mutex_lock(&ts->lock);
+	nvt_fw_ready_notify();
+	mutex_unlock(&ts->lock);
+
 	return 0;
 
 err_alloc_work_thread_failed:
@@ -1497,6 +1729,10 @@ static void nvt_ts_remove(struct spi_device *client)
 {
 	NVT_LOG("Removing driver...\n");
 
+	mutex_lock(&nvt_control_lock);
+	nvt_control_ts = NULL;
+	mutex_unlock(&nvt_control_lock);
+
 	bTouchIsAwake = 0;
 
 	mutex_destroy(&ts->pen_switch_lock);
@@ -1555,6 +1791,10 @@ static void nvt_ts_shutdown(struct spi_device *client)
 {
 	NVT_LOG("Shutdown driver...\n");
 
+	mutex_lock(&nvt_control_lock);
+	nvt_control_ts = NULL;
+	mutex_unlock(&nvt_control_lock);
+
 	nvt_irq_enable(false);
 
 	mutex_destroy(&ts->pen_switch_lock);
@@ -1601,6 +1841,7 @@ static int32_t nvt_ts_suspend(struct device *dev)
 	/*---write command to enter "deep sleep mode"---*/
 	buf[0] = EVENT_MAP_HOST_CMD;
 	buf[1] = 0x11;
+	nvt_pen_reset();
 	mutex_unlock(&ts->lock);
 
 	/* release all touches */
@@ -1612,19 +1853,6 @@ static int32_t nvt_ts_suspend(struct device *dev)
 	}
 	input_report_key(ts->input_dev, BTN_TOUCH, 0);
 	input_sync(ts->input_dev);
-
-	/* release pen event */
-	if (ts->pen_support) {
-		input_report_abs(ts->pen_input_dev, ABS_X, 0);
-		input_report_abs(ts->pen_input_dev, ABS_Y, 0);
-		input_report_abs(ts->pen_input_dev, ABS_PRESSURE, 0);
-		input_report_abs(ts->pen_input_dev, ABS_TILT_X, 0);
-		input_report_abs(ts->pen_input_dev, ABS_TILT_Y, 0);
-		input_report_abs(ts->pen_input_dev, ABS_DISTANCE, 0);
-		input_report_key(ts->pen_input_dev, BTN_TOUCH, 0);
-		input_report_key(ts->pen_input_dev, BTN_TOOL_PEN, 0);
-		input_sync(ts->pen_input_dev);
-	}
 
 	msleep(50);
 
@@ -1677,6 +1905,8 @@ static int32_t nvt_ts_resume(struct device *dev)
 	nvt_irq_enable(true);
 
 	bTouchIsAwake = 1;
+
+	nvt_fw_ready_notify();
 
 	if (likely(ts->ic_state == NVT_IC_RESUME_IN)) {
 		ts->ic_state = NVT_IC_RESUME_OUT;
@@ -1746,8 +1976,11 @@ MODULE_DEVICE_TABLE(of, nvt_match_table);
 static int nvt_pm_suspend(struct device *dev)
 {
 	NVT_LOG("system enters into pm_suspend");
-	ts->dev_pm_suspend = true;
+	/* Drain a userspace command before the SPI controller can suspend. */
+	mutex_lock(&ts->lock);
 	reinit_completion(&ts->dev_pm_suspend_completion);
+	ts->dev_pm_suspend = true;
+	mutex_unlock(&ts->lock);
 	NVT_LOG("system enters into pm_suspend2");
 	return 0;
 }
@@ -1757,6 +1990,9 @@ static int nvt_pm_resume(struct device *dev)
 	NVT_LOG("system resume from pm_suspend");
 	ts->dev_pm_suspend = false;
 	complete(&ts->dev_pm_suspend_completion);
+	mutex_lock(&ts->lock);
+	nvt_fw_ready_notify();
+	mutex_unlock(&ts->lock);
 	NVT_LOG("system resume from pm_suspend2");
 	return 0;
 }
@@ -1784,7 +2020,26 @@ static struct spi_driver nvt_spi_driver = {
 	},
 };
 
-module_spi_driver(nvt_spi_driver);
+static int __init nvt_driver_init(void)
+{
+	int ret;
+
+	ret = genl_register_family(&nvt_control_family);
+	if (ret)
+		return ret;
+	ret = spi_register_driver(&nvt_spi_driver);
+	if (ret)
+		genl_unregister_family(&nvt_control_family);
+	return ret;
+}
+module_init(nvt_driver_init);
+
+static void __exit nvt_driver_exit(void)
+{
+	spi_unregister_driver(&nvt_spi_driver);
+	genl_unregister_family(&nvt_control_family);
+}
+module_exit(nvt_driver_exit);
 
 MODULE_DESCRIPTION("Novatek Touchscreen Driver");
 MODULE_LICENSE("GPL");
