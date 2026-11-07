@@ -64,11 +64,12 @@ static void nvt_pen_report_state(struct nvt_ts_data *data)
 	u8 buttons = 0;
 	u8 owned = (data->pen_sources >> 1) & 3;
 
+	/* BLE side buttons are usable even when the pen is away from the IC. */
+	buttons = data->pen_buttons & owned;
 	if (data->pen_present) {
 		pressure = data->pen_sources & NVT_PEN_SOURCE_PRESSURE ?
 			data->pen_pressure : data->pen_ic_pressure;
-		buttons = (data->pen_buttons & owned) |
-			  (data->pen_ic_buttons & ~owned);
+		buttons |= data->pen_ic_buttons & ~owned;
 	}
 	input_report_abs(pen, ABS_PRESSURE, pressure);
 	input_report_key(pen, BTN_TOUCH, !!pressure);
@@ -78,24 +79,30 @@ static void nvt_pen_report_state(struct nvt_ts_data *data)
 			 (!!input_abs_get_val(pen, ABS_DISTANCE) || !!pressure));
 }
 
+/* Leave range without losing BLE button state or the last pen position. */
+static void nvt_pen_leave(void)
+{
+	ts->pen_present = false;
+	ts->pen_pressure = 0;
+	ts->pen_ic_pressure = 0;
+	ts->pen_ic_buttons = 0;
+	input_report_abs(ts->pen_input_dev, ABS_DISTANCE, 0);
+	nvt_pen_report_state(ts);
+	input_sync(ts->pen_input_dev);
+}
+
 /* Caller holds ts->lock. Retain source selection but discard session values. */
 void nvt_pen_reset(void)
 {
 	if (!ts->pen_input_dev)
 		return;
 
-	ts->pen_present = false;
-	ts->pen_pressure = 0;
-	ts->pen_ic_pressure = 0;
 	ts->pen_buttons = 0;
-	ts->pen_ic_buttons = 0;
 	input_report_abs(ts->pen_input_dev, ABS_X, 0);
 	input_report_abs(ts->pen_input_dev, ABS_Y, 0);
 	input_report_abs(ts->pen_input_dev, ABS_TILT_X, 0);
 	input_report_abs(ts->pen_input_dev, ABS_TILT_Y, 0);
-	input_report_abs(ts->pen_input_dev, ABS_DISTANCE, 0);
-	nvt_pen_report_state(ts);
-	input_sync(ts->pen_input_dev);
+	nvt_pen_leave();
 }
 
 /* Reserved local namespace; malformed messages must not reach the firmware. */
@@ -1257,7 +1264,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 				goto UNHANDLED_FRAME;
 			}
 		} else { // pen_format_id = 0xFF, i.e. no pen present
-			nvt_pen_reset();
+			nvt_pen_leave();
 		}
 
 		input_sync(ts->pen_input_dev);
