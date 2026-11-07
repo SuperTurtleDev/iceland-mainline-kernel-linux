@@ -44,6 +44,8 @@
 		interrupts-extended = <&tlmm 169 IRQ_TYPE_EDGE_FALLING>;
 
 		hboost-supply = <&pencil_hboost>;
+		/* The provider is registered by the PMIC GLINK auxiliary device. */
+		post-init-providers = <&pencil_hboost>;
 
 		power-gpios = <&pmih0108_e1_gpios 8 GPIO_ACTIVE_HIGH>;
 		wakeup-gpios = <&pmih0108_e1_gpios 2 GPIO_ACTIVE_HIGH>;
