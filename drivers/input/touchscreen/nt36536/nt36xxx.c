@@ -84,6 +84,8 @@ static void nvt_pen_report_state(struct nvt_ts_data *data)
 	u16 pressure = 0;
 	u8 buttons = 0;
 	u8 owned = (data->pen_sources >> 1) & 3;
+	bool was_proximate = atomic_read(&data->pen_proximity_count) > 0;
+	bool proximate;
 
 	/* Outside IC range, side buttons use the last valid pen position. */
 	if (data->pen_position_valid)
@@ -93,24 +95,29 @@ static void nvt_pen_report_state(struct nvt_ts_data *data)
 			data->pen_pressure : data->pen_ic_pressure;
 		buttons |= data->pen_ic_buttons & ~owned;
 		vote_proximity(data, NVT_PROXIMITY_IC);
+	} else {
+		devote_proximity(data, NVT_PROXIMITY_IC);
 	}
 	if (buttons & 1)
 		vote_proximity(data, NVT_PROXIMITY_STYLUS);
+	else
+		devote_proximity(data, NVT_PROXIMITY_STYLUS);
 	if (buttons & 2)
 		vote_proximity(data, NVT_PROXIMITY_STYLUS2);
+	else
+		devote_proximity(data, NVT_PROXIMITY_STYLUS2);
+	proximate = atomic_read(&data->pen_proximity_count) > 0;
 
 	input_report_abs(pen, ABS_PRESSURE, pressure);
 	input_report_key(pen, BTN_TOUCH, !!pressure);
 	input_report_key(pen, BTN_STYLUS, buttons & 1);
 	input_report_key(pen, BTN_STYLUS2, !!(buttons & 2));
-	input_report_key(pen, BTN_TOOL_PEN,
-			 atomic_read(&data->pen_proximity_count) > 0);
-	if (!(buttons & 2))
-		devote_proximity(data, NVT_PROXIMITY_STYLUS2);
-	if (!(buttons & 1))
-		devote_proximity(data, NVT_PROXIMITY_STYLUS);
-	if (!data->pen_present)
-		devote_proximity(data, NVT_PROXIMITY_IC);
+	input_report_key(pen, BTN_TOOL_PEN, proximate || was_proximate);
+	if (was_proximate && !proximate) {
+		/* Deliver button releases before the proximity-out frame. */
+		input_sync(pen);
+		input_report_key(pen, BTN_TOOL_PEN, 0);
+	}
 }
 
 /* Caller holds ts->lock. Retain source selection but discard session values. */
