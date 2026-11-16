@@ -150,65 +150,55 @@ static int iris_init_resources(struct iris_core *core)
 	return iris_init_resets(core);
 }
 
-static struct device *iris_create_cb_dev(struct iris_core *core, const char *name)
+static void iris_unreserve_iova_region(struct device *dev, struct dma_iova_state *iova_state)
 {
-	struct platform_device_info plat_dev_info = {};
-	struct device_node *child_of_node;
-	struct platform_device *pdev;
+	unsigned int i;
 
-	child_of_node = of_get_child_by_name(core->dev->of_node, name);
-	if (!child_of_node)
-		return NULL;
-
-	plat_dev_info.dma_mask = core->iris_platform_data->dma_mask;
-	plat_dev_info.fwnode = &child_of_node->fwnode;
-	plat_dev_info.name = child_of_node->name;
-	plat_dev_info.id = PLATFORM_DEVID_AUTO;
-	plat_dev_info.parent = core->dev;
-
-	pdev = platform_device_register_full(&plat_dev_info);
-	of_node_put(child_of_node);
-	if (IS_ERR(pdev))
-		return ERR_CAST(pdev);
-
-	dma_set_max_seg_size(&pdev->dev, DMA_BIT_MASK(32));
-	dma_set_seg_boundary(&pdev->dev, DMA_BIT_MASK(32));
-
-	return &pdev->dev;
+	for (i = 0; dma_iova_size(&iova_state[i]); i++)
+		dma_iova_free(dev, &iova_state[i]);
 }
 
-static int iris_init_cb_devs(struct iris_core *core)
+static int iris_reserve_iova_region(struct device *dev, struct dma_iova_state **iova_state,
+				    unsigned long start, unsigned long size)
 {
-	struct device *dev;
+	unsigned long dma_limit = dev->bus_dma_limit;
+	unsigned long end, rem, chunk;
+	struct dma_iova_state *state;
+	unsigned int count = 0;
+	int ret = -ENOMEM;
 
-	dev = iris_create_cb_dev(core, "non-pixel");
-	if (IS_ERR(dev))
-		return PTR_ERR(dev);
+	state = devm_kcalloc(dev, BITS_PER_TYPE(dma_addr_t) + 1, sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return ret;
 
-	core->np_dev = dev;
+	end = start + size;
+	rem = end - max(start, PAGE_SIZE);
+	dev->bus_dma_limit = end - 1;
 
-	dev = iris_create_cb_dev(core, "pixel");
-	if (IS_ERR(dev))
-		goto unreg_np_dev;
+	while (rem) {
+		chunk = min(end & -end, (u64)1 << (fls64(rem) - 1));
 
-	core->p_dev = dev;
+		if (!dma_iova_try_alloc(dev, &state[count], 0, chunk))
+			goto err_free_iova;
+
+		if (state[count].addr != end - chunk || state[count].__size != chunk)
+			goto err_free_iova;
+
+		rem -= chunk;
+		end -= chunk;
+		count++;
+	}
+
+	*iova_state = state;
+	dev->bus_dma_limit = dma_limit;
 
 	return 0;
 
-unreg_np_dev:
-	if (core->np_dev)
-		platform_device_unregister(to_platform_device(core->np_dev));
-	core->np_dev = NULL;
+err_free_iova:
+	iris_unreserve_iova_region(dev, state);
+	dev->bus_dma_limit = dma_limit;
 
-	return PTR_ERR(dev);
-}
-
-static void iris_deinit_cb_devs(struct iris_core *core)
-{
-	if (core->p_dev)
-		platform_device_unregister(to_platform_device(core->p_dev));
-	if (core->np_dev)
-		platform_device_unregister(to_platform_device(core->np_dev));
+	return ret;
 }
 
 static int iris_register_video_device(struct iris_core *core, enum domain_type type)
@@ -268,7 +258,7 @@ static void iris_remove(struct platform_device *pdev)
 
 	v4l2_device_unregister(&core->v4l2_dev);
 
-	iris_deinit_cb_devs(core);
+	iris_unreserve_iova_region(core->dev, core->iova_state);
 
 	mutex_destroy(&core->lock);
 }
@@ -332,13 +322,14 @@ static int iris_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = iris_init_cb_devs(core);
+	ret = iris_reserve_iova_region(dev, &core->iova_state, IRIS_NP_RESERVE_IOVA_START,
+				       IRIS_NP_RESERVE_IOVA_SIZE);
 	if (ret)
 		return ret;
 
 	ret = v4l2_device_register(dev, &core->v4l2_dev);
 	if (ret)
-		goto err_cb_deinit;
+		goto err_unresv_iova_region;
 
 	ret = iris_register_video_device(core, DECODER);
 	if (ret)
@@ -375,8 +366,8 @@ err_vdev_unreg_dec:
 	video_unregister_device(core->vdev_dec);
 err_v4l2_unreg:
 	v4l2_device_unregister(&core->v4l2_dev);
-err_cb_deinit:
-	iris_deinit_cb_devs(core);
+err_unresv_iova_region:
+	iris_unreserve_iova_region(dev, core->iova_state);
 
 	return ret;
 }
