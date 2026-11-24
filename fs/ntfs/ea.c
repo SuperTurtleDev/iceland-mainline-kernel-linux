@@ -37,7 +37,7 @@ static int ntfs_write_ea(struct ntfs_inode *ni, __le32 type, char *value, s64 ea
 		struct ntfs_inode *ea_ni = NTFS_I(ea_vi);
 
 		if (need_truncate && ea_ni->data_size > ea_off + ea_size)
-			ntfs_attr_truncate(ea_ni, ea_off + ea_size);
+			err = ntfs_attr_truncate(ea_ni, ea_off + ea_size);
 		mark_mft_record_dirty(ni);
 	}
 
@@ -695,6 +695,11 @@ static int ntfs_new_attr_flags(struct ntfs_inode *ni, __le32 fattr)
 	if ((new_aflags & (ATTR_IS_SPARSE | ATTR_IS_COMPRESSED)) ==
 			  (ATTR_IS_SPARSE | ATTR_IS_COMPRESSED)) {
 		pr_err("file can't be sparsed and compressed\n");
+		err = -EOPNOTSUPP;
+		goto err_out;
+	}
+
+	if ((new_aflags & ATTR_IS_COMPRESSED) && ni->vol->cluster_size > 4096) {
 		err = -EOPNOTSUPP;
 		goto err_out;
 	}

@@ -131,13 +131,12 @@ static void drm_mode_to_intf_timing_params(
 	if (phys_enc->hw_intf->cap->type != INTF_DP && timing->compression_en) {
 		struct drm_dsc_config *dsc =
 		       dpu_encoder_get_dsc_config(phys_enc->parent);
-		s64 comp_ratio, width;
-
-		width = drm_fixp_from_fraction(timing->width, 1);
-		comp_ratio = drm_fixp_from_fraction(mult_frac(100, dsc->bits_per_component * 3,
-							      drm_dsc_get_bpp_int(dsc)), 100);
-		width = drm_fixp_div(width, comp_ratio);
-		timing->width = drm_fixp2int_ceil(width);
+		/*
+		 * TODO: replace drm_dsc_get_bpp_int with logic to handle
+		 * fractional part if there is fraction
+		 */
+		timing->width = DIV_ROUND_UP(timing->width * drm_dsc_get_bpp_int(dsc),
+					     dsc->bits_per_component * 3);
 		timing->xres = timing->width;
 		timing->dce_bytes_per_line = msm_dsc_get_bytes_per_line(dsc);
 	}

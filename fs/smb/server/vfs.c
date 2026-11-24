@@ -65,11 +65,12 @@ static int ksmbd_vfs_path_lookup(struct ksmbd_share_config *share_conf,
 		if (for_remove)
 			return -EINVAL;
 
-		pathname = share_conf->path;
-		root_share_path = NULL;
-	} else {
-		flags |= LOOKUP_BENEATH;
+		*path = share_conf->vfs_path;
+		path_get(path);
+		return 0;
 	}
+
+	flags |= LOOKUP_BENEATH;
 
 	CLASS(filename_kernel, filename)(pathname);
 	scoped_with_init_fs()
@@ -902,8 +903,8 @@ ssize_t ksmbd_vfs_listxattr(struct dentry *dentry, char **list)
 	return size;
 }
 
-static ssize_t ksmbd_vfs_xattr_len(struct mnt_idmap *idmap,
-				   struct dentry *dentry, char *xattr_name)
+ssize_t ksmbd_vfs_xattr_len(struct mnt_idmap *idmap,
+			    struct dentry *dentry, char *xattr_name)
 {
 	return vfs_getxattr(idmap, dentry, xattr_name, NULL, 0);
 }
