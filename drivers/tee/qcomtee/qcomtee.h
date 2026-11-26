@@ -11,6 +11,7 @@
 
 #include "qcomtee_msg.h"
 #include "qcomtee_object.h"
+#include "qseecom_compat.h"
 
 /* Flags relating to object reference. */
 #define QCOMTEE_OBJREF_FLAG_TEE		BIT(0)
@@ -27,6 +28,7 @@
  * @xa_local_objects: array of objects exported to QTEE.
  * @xa_last_id: next ID to allocate.
  * @qtee_version: QTEE version.
+ * @uefisecapp: optional UEFI variable and RPMB client.
  */
 struct qcomtee {
 	struct tee_device *teedev;
@@ -37,6 +39,7 @@ struct qcomtee {
 	struct xarray xa_local_objects;
 	u32 xa_last_id;
 	u32 qtee_version;
+	struct qcomtee_uefisecapp *uefisecapp;
 };
 
 void qcomtee_fetch_async_reqs(struct qcomtee_object_invoke_ctx *oic);
@@ -145,6 +148,9 @@ int qcomtee_user_object_submit(struct tee_context *ctx,
 extern struct qcomtee_object qcomtee_primordial_object;
 
 /* (3) Memory Object API. */
+
+/* The returned object owns a reference to shm. */
+struct qcomtee_object *qcomtee_mem_object_alloc(struct tee_shm *shm);
 
 /* Is it a memory object using tee_shm? */
 int is_qcomtee_memobj_object(struct qcomtee_object *object);

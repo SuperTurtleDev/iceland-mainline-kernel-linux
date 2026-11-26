@@ -17,6 +17,8 @@
 #include <linux/rpmb.h>
 #include <linux/string.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
 #include <ufs/ufshcd.h>
 #include <linux/unaligned.h>
 #include "ufshcd-priv.h"
@@ -24,9 +26,8 @@
 #define UFS_RPMB_SEC_PROTOCOL		0xEC	/* JEDEC UFS application */
 #define UFS_RPMB_SEC_PROTOCOL_ID	0x01	/* JEDEC UFS RPMB protocol ID, CDB byte3 */
 
-static const struct bus_type ufs_rpmb_bus_type = {
-	.name = "ufs_rpmb",
-};
+/* Serialize complete transactions, including those for different regions. */
+static DEFINE_MUTEX(ufs_rpmb_lock);
 
 /* UFS RPMB device structure */
 struct ufs_rpmb_dev {
@@ -37,18 +38,56 @@ struct ufs_rpmb_dev {
 	struct list_head node;
 };
 
-static int ufs_sec_submit(struct ufs_hba *hba, u16 spsp, void *buffer, size_t len, bool send)
+static int ufs_sec_submit(struct ufs_hba *hba, u16 spsp, void *buffer,
+			  size_t len, bool send, bool first_request)
 {
 	struct scsi_device *sdev = hba->ufs_rpmb_wlun;
+	struct scsi_sense_hdr sshdr;
+	int resid, ret, attempt;
+	const struct scsi_exec_args args = {
+		.sshdr = &sshdr,
+		.resid = &resid,
+	};
 	u8 cdb[12] = { };
+
+	void *out __free(kfree_sensitive) = NULL;
+
+	if (first_request) {
+		out = kmalloc(len, GFP_KERNEL);
+		if (!out)
+			return -ENOMEM;
+	}
 
 	cdb[0] = send ? SECURITY_PROTOCOL_OUT : SECURITY_PROTOCOL_IN;
 	cdb[1] = UFS_RPMB_SEC_PROTOCOL;
 	put_unaligned_be16(spsp, &cdb[2]);
 	put_unaligned_be32(len, &cdb[6]);
 
-	return scsi_execute_cmd(sdev, cdb, send ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
-				buffer, len, /*timeout=*/30 * HZ, 0, NULL);
+	for (attempt = 0; ; attempt++) {
+		/* SCSI can zero residual bytes, including in an OUT buffer. */
+		if (out)
+			memcpy(out, buffer, len);
+		memset(&sshdr, 0, sizeof(sshdr));
+		resid = 0;
+		ret = scsi_execute_cmd(sdev, cdb, send ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
+				       out ?: buffer, len, 30 * HZ, 0, &args);
+		/* Current reset UA rejects this command before execution. */
+		if (!first_request || attempt || ret != SAM_STAT_CHECK_CONDITION ||
+		    !scsi_sense_valid(&sshdr) ||
+		    (sshdr.response_code != 0x70 && sshdr.response_code != 0x72) ||
+		    sshdr.sense_key != UNIT_ATTENTION || sshdr.asc != 0x29 || sshdr.ascq)
+			break;
+		dev_dbg(&sdev->sdev_gendev, "Retrying RPMB request after reset unit attention\n");
+	}
+	if (ret || resid) {
+		dev_err(&sdev->sdev_gendev,
+			"RPMB %s spsp=%#x result=%#x sense=%02x/%02x/%02x/%02x len=%zu resid=%d\n",
+			send ? "OUT" : "IN", spsp, ret, sshdr.response_code,
+			sshdr.sense_key, sshdr.asc, sshdr.ascq, len, resid);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	return 0;
 }
 
 /* UFS RPMB route frames implementation */
@@ -99,12 +138,18 @@ static int ufs_rpmb_route_frames(struct device *dev, u8 *req, unsigned int req_l
 		return -EINVAL;
 	}
 
+	/* bRPMB_ReadWriteSize limits both SECURITY PROTOCOL OUT and IN. */
+	if (req_len / sizeof(*frm_out) > hba->dev_info.rpmb_io_size ||
+	    resp_len / sizeof(*frm_out) > hba->dev_info.rpmb_io_size)
+		return -EINVAL;
+
 	protocol_id = ufs_rpmb->region_id << 8 | UFS_RPMB_SEC_PROTOCOL_ID;
 
-	ret = ufs_sec_submit(hba, protocol_id, req, req_len, true);
+	mutex_lock(&ufs_rpmb_lock);
+	ret = ufs_sec_submit(hba, protocol_id, req, req_len, true, true);
 	if (ret) {
 		dev_err(dev, "Command failed with ret=%d\n", ret);
-		return ret;
+		goto out_unlock;
 	}
 
 	if (need_result_read) {
@@ -112,27 +157,27 @@ static int ufs_rpmb_route_frames(struct device *dev, u8 *req, unsigned int req_l
 
 		memset(frm_resp, 0, sizeof(*frm_resp));
 		put_unaligned_be16(RPMB_RESULT_READ, &frm_resp->req_resp);
-		ret = ufs_sec_submit(hba, protocol_id, resp, resp_len, true);
+		ret = ufs_sec_submit(hba, protocol_id, resp, resp_len, true, false);
 		if (ret) {
 			dev_err(dev, "Result read request failed with ret=%d\n", ret);
-			return ret;
+			goto out_unlock;
 		}
 	}
 
-	if (!ret) {
-		ret = ufs_sec_submit(hba, protocol_id, resp, resp_len, false);
-		if (ret)
-			dev_err(dev, "Response read failed with ret=%d\n", ret);
-	}
+	ret = ufs_sec_submit(hba, protocol_id, resp, resp_len, false, false);
+	if (ret)
+		dev_err(dev, "Response read failed with ret=%d\n", ret);
 
-	return ret;
+out_unlock:
+	mutex_unlock(&ufs_rpmb_lock);
+	return ret > 0 ? -EIO : ret;
 }
 
 static void ufs_rpmb_device_release(struct device *dev)
 {
 	struct ufs_rpmb_dev *ufs_rpmb = dev_get_drvdata(dev);
 
-	rpmb_dev_unregister(ufs_rpmb->rdev);
+	kfree(ufs_rpmb);
 }
 
 /* UFS RPMB device registration */
@@ -167,22 +212,25 @@ int ufs_rpmb_probe(struct ufs_hba *hba)
 		if (!cap)
 			continue;
 
-		ufs_rpmb = devm_kzalloc(hba->dev, sizeof(*ufs_rpmb), GFP_KERNEL);
+		ufs_rpmb = kzalloc_obj(*ufs_rpmb);
 		if (!ufs_rpmb) {
 			ret = -ENOMEM;
 			goto err_out;
 		}
 
 		ufs_rpmb->hba = hba;
+		ufs_rpmb->region_id = region;
 		ufs_rpmb->dev.parent = &hba->ufs_rpmb_wlun->sdev_gendev;
-		ufs_rpmb->dev.bus = &ufs_rpmb_bus_type;
 		ufs_rpmb->dev.release = ufs_rpmb_device_release;
-		dev_set_name(&ufs_rpmb->dev, "ufs_rpmb%d", region);
-
-		/* Set driver data BEFORE device_register */
+		device_initialize(&ufs_rpmb->dev);
 		dev_set_drvdata(&ufs_rpmb->dev, ufs_rpmb);
+		ret = dev_set_name(&ufs_rpmb->dev, "ufs_rpmb%d", region);
+		if (ret) {
+			put_device(&ufs_rpmb->dev);
+			goto err_out;
+		}
 
-		ret = device_register(&ufs_rpmb->dev);
+		ret = device_add(&ufs_rpmb->dev);
 		if (ret) {
 			dev_err(hba->dev, "Failed to register UFS RPMB device %d\n", region);
 			put_device(&ufs_rpmb->dev);
@@ -214,7 +262,6 @@ int ufs_rpmb_probe(struct ufs_hba *hba)
 		cid = NULL;
 
 		ufs_rpmb->rdev = rdev;
-		ufs_rpmb->region_id = region;
 
 		list_add_tail(&ufs_rpmb->node, &hba->rpmbs);
 
@@ -226,6 +273,7 @@ err_out:
 	kfree(cid);
 	list_for_each_entry_safe(it, tmp, &hba->rpmbs, node) {
 		list_del(&it->node);
+		rpmb_dev_unregister(it->rdev);
 		device_unregister(&it->dev);
 	}
 
@@ -245,7 +293,8 @@ void ufs_rpmb_remove(struct ufs_hba *hba)
 		dev_info(hba->dev, "Removing UFS RPMB region %d\n", ufs_rpmb->region_id);
 		/* Remove from list first */
 		list_del(&ufs_rpmb->node);
-		/* Unregister device */
+		/* Stop routing and remove the child before its parent. */
+		rpmb_dev_unregister(ufs_rpmb->rdev);
 		device_unregister(&ufs_rpmb->dev);
 	}
 

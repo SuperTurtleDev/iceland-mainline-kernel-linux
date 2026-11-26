@@ -18,11 +18,16 @@
 /**
  * struct qseecom_client - QSEECOM client device.
  * @aux_dev: Underlying auxiliary device.
- * @app_id: ID of the loaded application.
+ * @app_id: ID of the loaded application, used by the legacy SCM transport.
+ * @app_send: Optional synchronous transport callback with the same arguments
+ *            and return convention as qcom_qseecom_app_send(). If NULL, use
+ *            qcom_scm_qseecom_app_send() with @app_id.
  */
 struct qseecom_client {
 	struct auxiliary_device aux_dev;
 	u32 app_id;
+	int (*app_send)(struct qseecom_client *client, void *req, size_t req_size,
+			void *rsp, size_t rsp_size);
 };
 
 /**
@@ -39,15 +44,21 @@ struct qseecom_client {
  * respective (app-specific) request data. The QSEE app reads this and returns
  * its response in the @rsp region.
  *
- * Note: This is a convenience wrapper around qcom_scm_qseecom_app_send().
+ * Uses the client's optional app_send callback if provided, otherwise falls
+ * back to qcom_scm_qseecom_app_send(). The response must be available before
+ * the callback returns; it must not retain the request or response buffers.
  * Clients should prefer to use this wrapper.
  *
- * Return: Zero on success, nonzero on failure.
+ * Return: Zero on successful transfer, nonzero on transport failure. Any
+ * app-specific status is returned in the response buffer.
  */
 static inline int qcom_qseecom_app_send(struct qseecom_client *client,
 					void *req, size_t req_size,
 					void *rsp, size_t rsp_size)
 {
+	if (client->app_send)
+		return client->app_send(client, req, req_size, rsp, rsp_size);
+
 	return qcom_scm_qseecom_app_send(client->app_id, req, req_size, rsp, rsp_size);
 }
 

@@ -45,16 +45,26 @@ EXPORT_SYMBOL_GPL(rpmb_dev_put);
  * @rsp:	rpmb response frames
  * @rsp_len:	length of rpmb response frames in bytes
  *
- * Returns: < 0 on failure
+ * The caller must hold a reference to @rdev. Transactions are serialized
+ * against each other and device unregistration.
+ *
+ * Returns: < 0 on failure, including -ENODEV after unregistration
  */
 int rpmb_route_frames(struct rpmb_dev *rdev, u8 *req,
 		      unsigned int req_len, u8 *rsp, unsigned int rsp_len)
 {
+	int ret = -ENODEV;
+
 	if (!req || !req_len || !rsp || !rsp_len)
 		return -EINVAL;
 
-	return rdev->descr.route_frames(rdev->dev.parent, req, req_len,
-					rsp, rsp_len);
+	mutex_lock(&rdev->lock);
+	if (rdev->descr.route_frames)
+		ret = rdev->descr.route_frames(rdev->dev.parent, req, req_len,
+					      rsp, rsp_len);
+	mutex_unlock(&rdev->lock);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(rpmb_route_frames);
 
@@ -123,8 +133,9 @@ EXPORT_SYMBOL_GPL(rpmb_interface_unregister);
  * rpmb_dev_unregister() - unregister RPMB partition from the RPMB subsystem
  * @rdev: the rpmb device to unregister
  *
- * This function should be called from the release function of the
- * underlying device used when the RPMB device was registered.
+ * Call this before unregistering the underlying device or releasing resources
+ * used by its route_frames callback. It waits for in-flight transactions and
+ * prevents further calls to the provider, including through retained references.
  *
  * Returns: < 0 on failure
  */
@@ -133,9 +144,12 @@ int rpmb_dev_unregister(struct rpmb_dev *rdev)
 	if (!rdev)
 		return -EINVAL;
 
-	device_del(&rdev->dev);
+	mutex_lock(&rdev->lock);
+	rdev->descr.route_frames = NULL;
+	mutex_unlock(&rdev->lock);
 
-	rpmb_dev_put(rdev);
+	/* Class removal callbacks must run without the transaction lock held. */
+	device_unregister(&rdev->dev);
 
 	return 0;
 }
@@ -164,6 +178,7 @@ struct rpmb_dev *rpmb_dev_register(struct device *dev,
 	rdev = kzalloc_obj(*rdev);
 	if (!rdev)
 		return ERR_PTR(-ENOMEM);
+	mutex_init(&rdev->lock);
 	rdev->descr = *descr;
 	rdev->descr.dev_id = kmemdup(descr->dev_id, descr->dev_id_len,
 				     GFP_KERNEL);

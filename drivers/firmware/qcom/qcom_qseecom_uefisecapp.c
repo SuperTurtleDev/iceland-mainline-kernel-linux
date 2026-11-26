@@ -845,6 +845,7 @@ static void qcom_uefisecapp_remove(struct auxiliary_device *aux_dev)
 
 static const struct auxiliary_device_id qcom_uefisecapp_id_table[] = {
 	{ .name = "qcom_qseecom.uefisecapp" },
+	{ .name = "qcomtee.uefisecapp" },
 	{}
 };
 MODULE_DEVICE_TABLE(auxiliary, qcom_uefisecapp_id_table);

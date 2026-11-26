@@ -89,7 +89,8 @@ static void qcomtee_do_release_qtee_object(struct work_struct *work)
 
 	object = container_of(work, struct qcomtee_object, work);
 	qcomtee = tee_get_drvdata(object->info.qcomtee_async_ctx->teedev);
-	/* Get the TEE context used for asynchronous operations. */
+	/* Each release, including a retry, starts a new invocation. */
+	memset(&qcomtee->oic, 0, sizeof(qcomtee->oic));
 	qcomtee->oic.ctx = object->info.qcomtee_async_ctx;
 
 	ret = qcomtee_object_do_invoke_internal(&qcomtee->oic, object,
@@ -802,10 +803,15 @@ int qcomtee_object_do_invoke_internal(struct qcomtee_object_invoke_ctx *oic,
 			 * If QCOMTEE_OIC_FLAG_SHARED is not set, put
 			 * QCOMTEE_OBJECT_TYPE_CB input objects.
 			 */
-			if (!(oic->flags & QCOMTEE_OIC_FLAG_SHARED))
+			if (!(oic->flags & QCOMTEE_OIC_FLAG_SHARED)) {
+				struct qcomtee_msg_object_invoke *msg = oic->in_msg.addr;
+
+				qcomtee_msg_for_each_input_object(i, msg)
+					qcomtee_object_id_put(oic, msg->args[i].o);
 				qcomtee_qtee_objects_put(u);
-			else
+			} else {
 				ret = -ENODEV;
+			}
 
 			goto out;
 

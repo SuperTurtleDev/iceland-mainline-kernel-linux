@@ -11,3 +11,15 @@ config QCOMTEE
 	  driver. It provides an API to access services offered by QTEE and
 	  its loaded Trusted Applications (TAs). Additionally, it facilitates
 	  the export of userspace services provided by supplicants to QTEE.
+
+config QCOMTEE_UEFISECAPP
+	bool "QTEE transport and RPMB backing for Qualcomm UEFI variables"
+	depends on QCOMTEE
+	depends on QCOM_QSEECOM_UEFISECAPP
+	depends on RPMB
+	help
+	  Connect the existing Qualcomm UEFI Secure App client to the QTEE
+	  QSEECom compatibility service. A kernel listener routes secure-world
+	  RPMB requests to the UFS RPMB subsystem without a userspace daemon.
+
+	  This is currently enabled only for the OnePlus Iceland platform.

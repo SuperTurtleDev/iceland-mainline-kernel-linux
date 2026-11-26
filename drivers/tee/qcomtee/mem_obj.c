@@ -64,7 +64,7 @@ static void qcomtee_mem_object_release(struct qcomtee_object *object)
 {
 	struct qcomtee_mem_object *mem_object = to_qcomtee_mem_object(object);
 
-	/* Matching get is in qcomtee_memobj_param_to_object(). */
+	/* Matching get is in qcomtee_mem_object_alloc(). */
 	tee_shm_put(mem_object->shm);
 	kfree(mem_object);
 }
@@ -89,34 +89,45 @@ int qcomtee_memobj_param_to_object(struct qcomtee_object **object,
 				   struct tee_context *ctx)
 {
 	struct tee_shm *shm;
-	int err;
-
-	struct qcomtee_mem_object *mem_object __free(kfree) = kzalloc_obj(*mem_object);
-	if (!mem_object)
-		return -ENOMEM;
+	struct qcomtee_object *mem_object;
 
 	shm = tee_shm_get_from_id(ctx, param->u.objref.id);
 	if (IS_ERR(shm))
 		return PTR_ERR(shm);
 
-	/* mem-object wrapping the memref. */
+	mem_object = qcomtee_mem_object_alloc(shm);
+	tee_shm_put(shm);
+	if (IS_ERR(mem_object))
+		return PTR_ERR(mem_object);
+
+	*object = mem_object;
+	return 0;
+}
+
+struct qcomtee_object *qcomtee_mem_object_alloc(struct tee_shm *shm)
+{
+	struct qcomtee_mem_object *mem_object;
+	int err;
+
+	mem_object = kzalloc_obj(*mem_object);
+	if (!mem_object)
+		return ERR_PTR(-ENOMEM);
+
 	err = qcomtee_object_user_init(&mem_object->object,
 				       QCOMTEE_OBJECT_TYPE_CB,
 				       &qcomtee_mem_object_ops, "tee-shm-%d",
 				       shm->id);
 	if (err) {
-		tee_shm_put(shm);
-
-		return err;
+		kfree(mem_object);
+		return ERR_PTR(err);
 	}
 
+	refcount_inc(&shm->refcount);
 	mem_object->paddr = shm->paddr;
 	mem_object->size = shm->size;
 	mem_object->shm = shm;
 
-	*object = &no_free_ptr(mem_object)->object;
-
-	return 0;
+	return &mem_object->object;
 }
 
 /* Reverse what qcomtee_memobj_param_to_object() does. */
